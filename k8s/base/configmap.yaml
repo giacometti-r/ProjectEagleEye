@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cyber-news-alert-config
+data:
+  LOG_LEVEL: "INFO"
+  REQUEST_TIMEOUT_SECONDS: "15"
+  MAX_ARTICLES_PER_SOURCE: "50"
+  ENABLE_GDELT: "true"
+  GDELT_QUERY_WINDOW_MINUTES: "180"
+  RSS_FEEDS: "https://krebsonsecurity.com/feed/,https://www.bleepingcomputer.com/feed/,https://therecord.media/feed/"
+  GOOGLE_NEWS_QUERIES: '["phishing attack company OR government OR university OR hospital","business email compromise attack organization","malvertising attack victim"]'
+  MIN_VICTIM_CONFIDENCE: "0.65"
+  INCIDENT_DEDUPE_WINDOW_HOURS: "48"
+  DIGEST_ENABLED: "true"
+  DIGEST_MAX_ITEMS_PER_RUN: "100"
+  ABSTRACT_MAX_CHARS: "420"
+  MAX_VICTIM_WORDS: "8"
+  POSTGRES_DB: "cyber_news"
+  POSTGRES_USER: "cyber_news"

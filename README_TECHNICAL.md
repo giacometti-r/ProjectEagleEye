@@ -17,10 +17,10 @@ Scope includes tracked project files under:
 - `app/`
 - `tests/`
 - `Dockerfile`
-- `docker-compose.yml`
 - `requirements.txt`
-- `ops/supercronic/cronjobs`
-- `.env.example`
+- `.github/workflows/`
+- `k8s/`
+- `.sops.yaml`
 - `.gitignore`
 - `README.md`
 - `LICENSE`
@@ -37,10 +37,10 @@ Scope excludes `.git` internals and cache artifacts (for example `__pycache__`, 
 - `README_TECHNICAL.md`: this deep technical reference.
 - `LICENSE`: MIT license terms.
 - `requirements.txt`: Python dependency lock list (pinned versions).
-- `Dockerfile`: runtime image build and supercronic install.
-- `docker-compose.yml`: local orchestration for `postgres`, one-shot `app`, and scheduled `scheduler` services.
-- `.env`: local runtime environment file consumed by `load_dotenv()` (values intentionally not documented here).
-- `.env.example`: required/optional environment template.
+- `Dockerfile`: production runtime image build.
+- `.github/workflows/`: pull request validation and main-branch image/GitOps pipeline.
+- `k8s/`: Kubernetes base, production overlay, SOPS-ready Secret, and Argo CD Application.
+- `.sops.yaml`: SOPS creation rule for the production secret manifest.
 - `.gitignore`: VCS ignore policy.
 - `.vscode/settings.json`: local IDE Python environment preferences.
 - `.codex`: Codex-local marker file present in repository root.
@@ -76,7 +76,10 @@ Scope excludes `.git` internals and cache artifacts (for example `__pycache__`, 
 
 ### 2.4 Ops
 
-- `ops/supercronic/cronjobs`: hourly schedule invoking `python -m app.main`.
+- `k8s/base/cronjob.yaml`: hourly Kubernetes CronJob invoking `python -m app.main`.
+- `k8s/base/postgres-statefulset.yaml`: namespaced PostgreSQL runtime with PVC-backed storage.
+- `k8s/overlays/prod/kustomization.yaml`: production image tag and Secret resource composition.
+- `k8s/argocd/application.yaml`: Argo CD Application targeting the production overlay.
 
 ---
 
@@ -86,7 +89,7 @@ Scope excludes `.git` internals and cache artifacts (for example `__pycache__`, 
 
 Execution starts at `app.main.main()`:
 
-1. `load_settings()` reads `.env` and environment variables into immutable `Settings`.
+1. `load_settings()` reads process environment variables into immutable `Settings`.
 2. `configure_logging()` applies `logging.basicConfig(...)` globally.
 3. `Database(settings)` creates SQLAlchemy engine/session factory.
 4. `initialize_schema(database)` creates tables and applies idempotent compatibility DDL.
@@ -140,13 +143,14 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 
 ### 3.6 Scheduling and Operations
 
-- Containerized execution via `docker compose`.
-- `scheduler` runs `supercronic` with `ops/supercronic/cronjobs`.
-- Cron expression `0 * * * *` invokes `/usr/local/bin/python -m app.main` hourly.
+- Containerized execution uses the production `Dockerfile`.
+- Kubernetes scheduling is defined by `k8s/base/cronjob.yaml`.
+- Cron expression `0 * * * *` invokes `python -m app.main` hourly.
+- Argo CD syncs `k8s/overlays/prod` into namespace `cyber-news-alert`.
 
 ---
 
-## 4. Configuration Reference (`app/config.py` + `.env.example`)
+## 4. Configuration Reference (`app/config.py` + Kubernetes env)
 
 ### 4.1 Symbol Reference
 
@@ -194,7 +198,7 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 #### `load_settings() -> Settings`
 
 - Purpose: one-shot loader for all runtime settings.
-- Side effects: calls `load_dotenv()`.
+- Side effects: reads process environment only.
 - Output: fully populated `Settings` object.
 - Failure:
   - `ConfigError` from missing required vars or invalid list JSON.
@@ -218,9 +222,6 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 | `gdelt_query_window_minutes` | `GDELT_QUERY_WINDOW_MINUTES` | `int` | no | `180` | `int(...)` | GDELT time window (`timespan`). |
 | `rss_feeds` | `RSS_FEEDS` | `list[str]` | no | `DEFAULT_RSS_FEEDS` | `_parse_list_env` | Instantiates `RssSource` entries. |
 | `google_news_queries` | `GOOGLE_NEWS_QUERIES` | `list[str]` | no | `DEFAULT_GOOGLE_NEWS_QUERIES` | `_parse_list_env` | Instantiates `GoogleNewsRssSource` entries. |
-| `enable_generic_victim_fallback` | `ENABLE_GENERIC_VICTIM_FALLBACK` | `bool` | no | `true` | truthy set | Deprecated compatibility flag; immediate path no longer uses generic fallback. |
-| `generic_victim_name` | `GENERIC_VICTIM_NAME` | `str` | no | `Unknown organization` | strip + fallback | Deprecated compatibility value stored in pipeline config. |
-| `default_victim_category` | `DEFAULT_VICTIM_CATEGORY` | `str` | no | `company` | strip + lowercase + fallback | Deprecated compatibility value stored in pipeline config. |
 | `min_victim_confidence` | `MIN_VICTIM_CONFIDENCE` | `float` | no | `0.65` | `float(...)` | Threshold for immediate-channel eligibility. |
 | `incident_dedupe_window_hours` | `INCIDENT_DEDUPE_WINDOW_HOURS` | `int` | no | `48` | `int(...)` | Time window for incident-key suppression. |
 | `digest_enabled` | `DIGEST_ENABLED` | `bool` | no | `true` | truthy set | Enables final digest flush/send. |
@@ -391,11 +392,9 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 
 Constructor:
 
-`__init__(database, fetcher, classifier, victim_extractor, emailer, min_victim_confidence=0.65, enable_generic_victim_fallback=True, generic_victim_name="Unknown organization", default_victim_category="company", incident_dedupe_window_hours=48, digest_enabled=True, digest_recipient_email=None, digest_max_items_per_run=100)`
+`__init__(database, fetcher, classifier, victim_extractor, emailer, min_victim_confidence=0.65, incident_dedupe_window_hours=48, digest_enabled=True, digest_recipient_email=None, digest_max_items_per_run=100)`
 
 - Purpose: inject all collaborators and policy controls.
-- Notes:
-  - Generic fallback args retained for compatibility but not used to qualify immediate alerts.
 
 Methods:
 
@@ -861,7 +860,6 @@ Pinned dependencies and primary usage:
 - `feedparser`: RSS/Atom parsing.
 - `googlenewsdecoder`: decode Google News redirect URLs.
 - `psycopg2-binary`: PostgreSQL driver for SQLAlchemy.
-- `python-dotenv`: `.env` loading.
 - `requests`: HTTP transport.
 - `SQLAlchemy`: ORM and DB access.
 - `tenacity`: retry policies for network calls.
@@ -874,53 +872,32 @@ Build behavior:
 
 1. Base image: `python:3.11-slim`.
 2. Environment flags: `PYTHONDONTWRITEBYTECODE=1`, `PYTHONUNBUFFERED=1`.
-3. Installs `curl` and CA certificates.
-4. Downloads `supercronic` binary (`v0.2.34`) to `/usr/local/bin/supercronic`.
-5. Installs Python dependencies from `requirements.txt`.
-6. Copies `app/` and `ops/`.
+3. Creates non-root user `appuser`.
+4. Installs Python dependencies from `requirements.txt`.
+5. Copies `app/`.
+6. Switches to non-root execution.
 7. Default command: `python -m app.main`.
 
-## 8.3 `docker-compose.yml`
+## 8.3 Kubernetes and GitOps
 
-Defined services:
+- `k8s/base/namespace.yaml`: creates namespace `cyber-news-alert`.
+- `k8s/base/configmap.yaml`: non-secret runtime controls and PostgreSQL database/user names.
+- `k8s/overlays/prod/secrets.enc.yaml`: SOPS-managed Kubernetes Secret for SMTP, recipient, database URL, and PostgreSQL password.
+- `k8s/base/postgres-statefulset.yaml`: PostgreSQL `StatefulSet` using the cluster default storage class.
+- `k8s/base/cronjob.yaml`: hourly monitor execution with `concurrencyPolicy: Forbid`.
+- `k8s/argocd/application.yaml`: Argo CD Application for automated prune/self-heal sync.
 
-- `postgres`
-  - Image: `postgres:16-alpine`.
-  - DB credentials/database fixed for local usage.
-  - Persistent volume: `postgres_data`.
-  - Healthcheck: `pg_isready`.
+## 8.4 GitHub Actions
 
-- `app`
-  - Built from local `Dockerfile`.
-  - Uses `.env`.
-  - Waits for healthy `postgres`.
-  - `restart: "no"` for one-shot/manual runs.
+- `.github/workflows/pull-request.yml`: installs dependencies, runs tests, and builds the Docker image on pull requests.
+- `.github/workflows/deploy.yml`: on `main`, runs tests, pushes the image to GHCR, updates the Kustomize image tag, and commits the GitOps update.
 
-- `scheduler`
-  - Built from local `Dockerfile`.
-  - Command: `supercronic /app/ops/supercronic/cronjobs`.
-  - Uses `.env` and healthy `postgres` dependency.
-  - `restart: unless-stopped` for long-running schedule.
-
-## 8.4 `ops/supercronic/cronjobs`
-
-Single cron entry:
-
-- `0 * * * * /usr/local/bin/python -m app.main`
-
-Semantics: execute once per hour at minute `00`.
-
-## 8.5 `.env.example`
-
-- Documents required SMTP/DB fields and optional runtime controls.
-- Explicitly marks compatibility victim fallback vars as deprecated for immediate-channel logic.
-
-## 8.6 `.gitignore`
+## 8.5 `.gitignore`
 
 - Baseline Python ignore template plus project-specific exclusions (`.env`, `.vscode`, `.codex`, `analysis/`, caches/build artifacts).
 - Prevents committing local secrets, local IDE config, runtime caches, and generated artifacts.
 
-## 8.7 `README.md` Relationship
+## 8.6 `README.md` Relationship
 
 - `README.md` is operational/how-to oriented.
 - `README_TECHNICAL.md` is implementation internals and behavioral contract oriented.

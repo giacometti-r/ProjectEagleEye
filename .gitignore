@@ -225,3 +225,8 @@ __marimo__/
 
 # my folders
 analysis/
+new_email.txt
+.graphify*
+graphify-out/
+.agents/
+AGENTS.md

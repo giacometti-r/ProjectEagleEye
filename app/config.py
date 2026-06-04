@@ -5,8 +5,6 @@ import os
 from dataclasses import dataclass
 from typing import List
 
-from dotenv import load_dotenv
-
 
 DEFAULT_RSS_FEEDS = [
     "https://krebsonsecurity.com/feed/",
@@ -46,9 +44,6 @@ class Settings:
     gdelt_query_window_minutes: int
     rss_feeds: List[str]
     google_news_queries: List[str]
-    enable_generic_victim_fallback: bool
-    generic_victim_name: str
-    default_victim_category: str
     min_victim_confidence: float
     incident_dedupe_window_hours: int
     digest_enabled: bool
@@ -88,8 +83,6 @@ def _parse_list_env(name: str, default: List[str]) -> List[str]:
 
 
 def load_settings() -> Settings:
-    load_dotenv()
-
     return Settings(
         smtp_host=_require("SMTP_HOST"),
         smtp_port=int(os.getenv("SMTP_PORT", "587")),
@@ -105,10 +98,6 @@ def load_settings() -> Settings:
         gdelt_query_window_minutes=int(os.getenv("GDELT_QUERY_WINDOW_MINUTES", "180")),
         rss_feeds=_parse_list_env("RSS_FEEDS", DEFAULT_RSS_FEEDS),
         google_news_queries=_parse_list_env("GOOGLE_NEWS_QUERIES", DEFAULT_GOOGLE_NEWS_QUERIES),
-        enable_generic_victim_fallback=os.getenv("ENABLE_GENERIC_VICTIM_FALLBACK", "true").strip().lower()
-        in {"1", "true", "yes"},
-        generic_victim_name=os.getenv("GENERIC_VICTIM_NAME", "Unknown organization").strip() or "Unknown organization",
-        default_victim_category=os.getenv("DEFAULT_VICTIM_CATEGORY", "company").strip().lower() or "company",
         min_victim_confidence=float(os.getenv("MIN_VICTIM_CONFIDENCE", "0.65")),
         incident_dedupe_window_hours=int(os.getenv("INCIDENT_DEDUPE_WINDOW_HOURS", "48")),
         digest_enabled=os.getenv("DIGEST_ENABLED", "true").strip().lower() in {"1", "true", "yes"},

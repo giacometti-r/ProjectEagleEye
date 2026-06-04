@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cyber-news-alert
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/giacometti-r/ProjectEagleEye.git
+    targetRevision: main
+    path: k8s/overlays/prod
+    plugin:
+      name: ksops
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cyber-news-alert
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

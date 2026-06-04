@@ -1,0 +1,36 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cyber-news-alert
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: cyber-news-alert
+            app.kubernetes.io/part-of: cyber-news-alert
+        spec:
+          serviceAccountName: cyber-news-alert
+          restartPolicy: Never
+          containers:
+            - name: monitor
+              image: ghcr.io/giacometti-r/projecteagleeye:latest
+              imagePullPolicy: IfNotPresent
+              envFrom:
+                - configMapRef:
+                    name: cyber-news-alert-config
+                - secretRef:
+                    name: cyber-news-alert-secrets
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi

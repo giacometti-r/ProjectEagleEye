@@ -55,9 +55,6 @@ class MonitorPipeline:
         victim_extractor: VictimExtractor,
         emailer: Emailer,
         min_victim_confidence: float = 0.65,
-        enable_generic_victim_fallback: bool = True,
-        generic_victim_name: str = "Unknown organization",
-        default_victim_category: str = "company",
         incident_dedupe_window_hours: int = 48,
         digest_enabled: bool = True,
         digest_recipient_email: str | None = None,
@@ -69,10 +66,6 @@ class MonitorPipeline:
         self.victim_extractor = victim_extractor
         self.emailer = emailer
         self.min_victim_confidence = min_victim_confidence
-        # Deprecated compatibility flags. Immediate channel no longer uses generic fallback.
-        self.enable_generic_victim_fallback = enable_generic_victim_fallback
-        self.generic_victim_name = generic_victim_name
-        self.default_victim_category = default_victim_category
         self.incident_dedupe_window_hours = incident_dedupe_window_hours
         self.digest_enabled = digest_enabled
         self.digest_recipient_email = digest_recipient_email or emailer.recipient_email

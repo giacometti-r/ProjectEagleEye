@@ -1,6 +1,6 @@
 # Cyber News Alert Monitor
 
-Dockerized Python 3.11 service that monitors free cybersecurity news sources (RSS, Google News RSS, optional GDELT), classifies social-engineering stories, deduplicates results in PostgreSQL, and sends SMTP alerts.
+Python 3.11 service that monitors free cybersecurity news sources (RSS, Google News RSS, optional GDELT), classifies social-engineering stories, deduplicates results in PostgreSQL, and sends SMTP alerts. Production deployment is GitOps-based on Kubernetes with GitHub Actions, GHCR, Argo CD, Kustomize, and SOPS-managed secrets.
 
 ## Features
 
@@ -24,21 +24,17 @@ Dockerized Python 3.11 service that monitors free cybersecurity news sources (RS
 - `app/alerts/emailer.py`: SMTP sender and digest formatting
 - `app/models.py`: SQLAlchemy models
 - `app/schema_init.py`: idempotent schema setup and column backfill
-- `ops/supercronic/cronjobs`: hourly scheduler expression
+- `k8s/`: Kubernetes base, production overlay, and Argo CD application
+- `.github/workflows/`: pull request validation and main-branch image/GitOps pipeline
 - `tests/`: unit and integration-lite tests
 
 ## Configuration
 
-1. Copy and edit environment file:
+Runtime configuration is injected by Kubernetes.
 
-```bash
-cp .env.example .env
-```
+Secret values live in `k8s/overlays/prod/secrets.enc.yaml`, which must be encrypted with SOPS before production sync. Non-secret runtime controls live in `k8s/base/configmap.yaml`.
 
-2. Set SMTP credentials and recipient values in `.env`.
-3. Keep `DATABASE_URL` using service host `postgres` for Docker Compose.
-
-Required variables:
+Required secret variables:
 
 - `SMTP_HOST`
 - `SMTP_PORT`
@@ -46,6 +42,8 @@ Required variables:
 - `SMTP_PASSWORD`
 - `SENDER_EMAIL`
 - `RECIPIENT_EMAIL`
+- `DIGEST_RECIPIENT_EMAIL`
+- `POSTGRES_PASSWORD`
 - `DATABASE_URL`
 
 Optional runtime controls:
@@ -65,11 +63,37 @@ Optional runtime controls:
 - `ABSTRACT_MAX_CHARS` (default: `420`)
 - `MAX_VICTIM_WORDS` (default: `8`)
 
-Deprecated compatibility controls:
+## Kubernetes Deployment
 
-- `ENABLE_GENERIC_VICTIM_FALLBACK` (kept for compatibility, not used for immediate channel in v2)
-- `GENERIC_VICTIM_NAME`
-- `DEFAULT_VICTIM_CATEGORY`
+The production overlay deploys:
+
+- namespace `cyber-news-alert`
+- in-cluster PostgreSQL `StatefulSet` with a PVC
+- hourly `CronJob` running `python -m app.main`
+- app image `ghcr.io/giacometti-r/projecteagleeye`
+- SOPS-managed Kubernetes `Secret`
+
+Bootstrap:
+
+```bash
+# Replace .sops.yaml with your age public key first.
+sops --encrypt --in-place k8s/overlays/prod/secrets.enc.yaml
+
+# Apply once after Argo CD and SOPS/KSOPS support are installed.
+kubectl apply -f k8s/argocd/application.yaml
+```
+
+Validate rendered manifests:
+
+```bash
+kubectl apply --dry-run=client -k k8s/overlays/prod
+```
+
+## CI/CD
+
+- Pull requests install dependencies, run `pytest`, and build the container image locally.
+- Pushes to `main` run tests, build and push the image to GHCR, update `k8s/overlays/prod/kustomization.yaml` with the commit SHA tag, and commit that GitOps change.
+- Argo CD watches `k8s/overlays/prod` on `main` and syncs the cluster with prune/self-heal enabled.
 
 ## Security Controls
 
@@ -80,53 +104,13 @@ Deprecated compatibility controls:
 - **Response limits**: article downloads enforce content-type checks and response size limits before parsing.
 - **Dependency policy**: pin dependencies and update promptly for security advisories (including transitive/development tooling).
 
-## Run with Docker
-
-Build and run scheduler + database:
-
-```bash
-sudo docker compose up --build -d postgres scheduler
-```
-
-Run one manual execution:
-
-```bash
-sudo docker compose run --rm app
-```
-
-Check logs:
-
-```bash
-sudo docker compose logs -f scheduler
-```
-
-Stop all services and remove containers/network:
-
-```bash
-sudo docker compose down
-```
-
-Restart everything cleanly:
-
-```bash
-sudo docker compose up --build -d
-```
-
-Full reset (also removes Postgres data volume):
-
-```bash
-sudo docker compose down -v
-```
-
 ## Hourly Scheduling
 
-The scheduler container runs:
-
-- `supercronic /app/ops/supercronic/cronjobs`
+Kubernetes owns scheduling through `k8s/base/cronjob.yaml`.
 
 Default cron expression:
 
-- `0 * * * * /usr/local/bin/python -m app.main`
+- `0 * * * *`
 
 This executes at minute 0 every hour.
 
