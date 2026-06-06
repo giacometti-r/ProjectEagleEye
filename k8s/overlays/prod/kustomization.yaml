@@ -3,6 +3,7 @@ kind: Kustomization
 namespace: cyber-news-alert
 resources:
   - ../../base
+generators:
   - secret-generator.yaml
 images:
   - name: ghcr.io/giacometti-r/projecteagleeye
