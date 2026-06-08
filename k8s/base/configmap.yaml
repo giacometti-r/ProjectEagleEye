@@ -11,7 +11,7 @@ data:
   RSS_FEEDS: "https://krebsonsecurity.com/feed/,https://www.bleepingcomputer.com/feed/,https://therecord.media/feed/"
   GOOGLE_NEWS_QUERIES: '["phishing attack company OR government OR university OR hospital","business email compromise attack organization","malvertising attack victim"]'
   MIN_VICTIM_CONFIDENCE: "0.65"
-  INCIDENT_DEDUPE_WINDOW_HOURS: "48"
+  INCIDENT_DEDUPE_WINDOW_HOURS: "120"
   DIGEST_ENABLED: "true"
   DIGEST_MAX_ITEMS_PER_RUN: "100"
   ABSTRACT_MAX_CHARS: "420"

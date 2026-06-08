@@ -1,0 +1,5 @@
+- Automatically save logs once CronJob completed
+- Some news articles were irrelevant (e.g "Defiant merkel defends refugee stance after attacks" probably got triggered because of the word attacks)
+- Run security audit
+- Add 2x /n for between digest categories and 1x /n for digest in same category for better readibility 
+- Some dupliacte articles still exist, could be deduplication logic or lookback period is too short
