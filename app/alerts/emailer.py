@@ -102,12 +102,12 @@ class Emailer:
 
         lines: list[str] = ["Queued items by reason:", ""]
         for reason in sorted(grouped.keys()):
-            lines.append(f"Reason: {reason} ({len(grouped[reason])})")
+            lines.append(f"\nReason: {reason} ({len(grouped[reason])})")
             for entry in grouped[reason]:
                 attack_type = entry.attack_type or "unknown"
                 victim = entry.victim_name or "n/a"
                 lines.append(
-                    f"- {entry.title}\n"
+                    f"\n- {entry.title}\n"
                     f"  Source: {entry.source_name}\n"
                     f"  Attack type: {attack_type}\n"
                     f"  Victim: {victim}\n"
