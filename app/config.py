@@ -15,16 +15,9 @@ DEFAULT_RSS_FEEDS = [
 ]
 
 DEFAULT_GOOGLE_NEWS_QUERIES = [
-    'phishing attack company OR government OR university OR hospital',
-    'business email compromise attack organization',
-    'malvertising attack victim',
-    'credential theft phishing victim organization',
-    'smishing OR vishing attack',
-    'seo poisoning attack victim',
-    'watering hole attack organization',
-    'social media scam organization compromised',
-    'impersonation scam company targeted',
-    'fake update malware attack organization',
+    '(phishing OR "spear phishing" OR "business email compromise") (company OR government OR university OR hospital OR organization)',
+    '(malvertising OR "credential theft" OR smishing OR vishing) (victim OR company OR organization)',
+    '("SEO poisoning" OR "watering hole" OR "social media scam" OR impersonation OR "fake update") (cyber OR malware OR credentials OR organization)',
 ]
 
 
@@ -46,6 +39,11 @@ class Settings:
     google_news_queries: List[str]
     min_victim_confidence: float
     incident_dedupe_window_hours: int
+    near_duplicate_enabled: bool
+    near_duplicate_threshold: float
+    near_duplicate_lookback_hours: int | None
+    near_duplicate_max_comparisons: int
+    suppress_out_of_scope_digest: bool
     digest_enabled: bool
     digest_recipient_email: str
     digest_max_items_per_run: int
@@ -100,6 +98,17 @@ def load_settings() -> Settings:
         google_news_queries=_parse_list_env("GOOGLE_NEWS_QUERIES", DEFAULT_GOOGLE_NEWS_QUERIES),
         min_victim_confidence=float(os.getenv("MIN_VICTIM_CONFIDENCE", "0.65")),
         incident_dedupe_window_hours=int(os.getenv("INCIDENT_DEDUPE_WINDOW_HOURS", "48")),
+        near_duplicate_enabled=os.getenv("NEAR_DUPLICATE_ENABLED", "true").strip().lower()
+        in {"1", "true", "yes"},
+        near_duplicate_threshold=float(os.getenv("NEAR_DUPLICATE_THRESHOLD", "0.78")),
+        near_duplicate_lookback_hours=(
+            int(os.getenv("NEAR_DUPLICATE_LOOKBACK_HOURS", "").strip())
+            if os.getenv("NEAR_DUPLICATE_LOOKBACK_HOURS", "").strip()
+            else None
+        ),
+        near_duplicate_max_comparisons=int(os.getenv("NEAR_DUPLICATE_MAX_COMPARISONS", "500")),
+        suppress_out_of_scope_digest=os.getenv("SUPPRESS_OUT_OF_SCOPE_DIGEST", "true").strip().lower()
+        in {"1", "true", "yes"},
         digest_enabled=os.getenv("DIGEST_ENABLED", "true").strip().lower() in {"1", "true", "yes"},
         digest_recipient_email=os.getenv("DIGEST_RECIPIENT_EMAIL", os.getenv("RECIPIENT_EMAIL", "")).strip()
         or _require("RECIPIENT_EMAIL"),

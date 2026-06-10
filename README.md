@@ -6,12 +6,13 @@ Python 3.11 service that monitors free cybersecurity news sources (RSS, Google N
 
 - Free sources only: curated RSS feeds, Google News RSS queries, optional GDELT Doc API.
 - Closed attack taxonomy for immediate alerts: phishing, malvertising, impersonation, business email compromise, smishing, vishing, fake updates, SEO poisoning, watering hole, social media scams, credential theft.
-- Article-type gating: `incident`, `campaign_report`, `advisory`, `press_release`, `legal_followup`, `opinion`.
+- Article-type gating: `incident`, `campaign_report`, `advisory`, `press_release`, `legal_followup`, `opinion`, `out_of_scope`.
 - Strict immediate alerting: immediate emails only for qualified incidents with in-taxonomy attack type and confident victim extraction.
-- Digest channel: one digest email per run for queued non-immediate items.
+- Digest channel: one digest email per run for queued non-immediate items; clearly out-of-scope items are suppressed by default.
 - Cross-source incident dedupe: 48-hour incident-key dedupe to suppress syndicated rewrites in immediate channel.
+- TF-IDF cosine near-duplicate detection to skip syndicated/reworded articles before alerting.
 - Boilerplate-resistant article cleanup and improved abstract generation with metadata fallback.
-- URL/fingerprint/content-hash dedupe plus robust retries/logging.
+- URL/fingerprint/content-hash dedupe plus conservative victim extraction and robust retries/logging.
 
 ## Project Structure
 
@@ -20,7 +21,7 @@ Python 3.11 service that monitors free cybersecurity news sources (RSS, Google N
 - `app/sources/`: RSS, Google News RSS, GDELT source adapters
 - `app/fetch/article_fetcher.py`: article extraction and abstract generation
 - `app/detection/`: attack classifier and victim extractor
-- `app/dedup/deduplicator.py`: canonicalization, hashes, incident key
+- `app/dedup/deduplicator.py`: canonicalization, hashes, incident key, TF-IDF similarity
 - `app/alerts/emailer.py`: SMTP sender and digest formatting
 - `app/models.py`: SQLAlchemy models
 - `app/schema_init.py`: idempotent schema setup and column backfill
@@ -57,6 +58,11 @@ Optional runtime controls:
 - `GOOGLE_NEWS_QUERIES` (comma-separated or JSON array)
 - `MIN_VICTIM_CONFIDENCE` (default: `0.65`)
 - `INCIDENT_DEDUPE_WINDOW_HOURS` (default: `48`)
+- `NEAR_DUPLICATE_ENABLED` (default: `true`)
+- `NEAR_DUPLICATE_THRESHOLD` (default: `0.78`)
+- `NEAR_DUPLICATE_LOOKBACK_HOURS` (default: fallback to `INCIDENT_DEDUPE_WINDOW_HOURS`)
+- `NEAR_DUPLICATE_MAX_COMPARISONS` (default: `500`)
+- `SUPPRESS_OUT_OF_SCOPE_DIGEST` (default: `true`)
 - `DIGEST_ENABLED` (default: `true`)
 - `DIGEST_RECIPIENT_EMAIL` (default: fallback to `RECIPIENT_EMAIL`)
 - `DIGEST_MAX_ITEMS_PER_RUN` (default: `100`)
@@ -119,23 +125,25 @@ This executes at minute 0 every hour.
 Each candidate article is deduplicated by:
 
 1. **Canonical URL**: strips tracking parameters (`utm_*`, `gclid`, `fbclid`) and normalizes URL parts.
-2. **Fingerprint hash**: SHA-256 over normalized title + article text prefix.
-3. **Incident key (immediate channel only)**: SHA-256 over normalized `(victim + attack type)` with a time window (`INCIDENT_DEDUPE_WINDOW_HOURS`) to suppress cross-source duplicate incident alerts.
-4. **Content hash**: SHA-256 over normalized full text (stored for audit/analysis).
+2. **Content hash**: SHA-256 over normalized full text to skip exact body duplicates.
+3. **TF-IDF cosine similarity**: compares normalized title + abstract + article-text prefix against recent stored articles to skip near-duplicates.
+4. **Fingerprint hash**: SHA-256 over normalized title + article text prefix.
+5. **Incident key (immediate channel only)**: SHA-256 over normalized `(victim + attack type)` with a time window (`INCIDENT_DEDUPE_WINDOW_HOURS`) to suppress same-victim incident follow-ups from immediate alerts.
 
-If canonical URL or fingerprint already exists, the article is skipped.
+If canonical URL, content hash, near-duplicate similarity, or fingerprint already matches, the article is skipped.
 
 ## Alert Qualification Flow (Two Channels)
 
 1. Fetch article and generate cleaned text + abstract.
 2. Classify article type and attack type using weighted title/lead/body scoring.
-3. Extract victim with title-first and body fallback patterns.
-4. Immediate channel requires all of:
+3. Suppress `out_of_scope` articles from digest when `SUPPRESS_OUT_OF_SCOPE_DIGEST=true`.
+4. Extract victim with conservative title-first and body fallback patterns.
+5. Immediate channel requires all of:
    - `article_type == incident`
    - in-taxonomy `attack_type` present
    - victim confidence >= `MIN_VICTIM_CONFIDENCE`
    - no incident-key duplicate within `INCIDENT_DEDUPE_WINDOW_HOURS`
-5. If immediate criteria fail, route to digest queue with routing reason:
+6. If immediate criteria fail, route to digest queue with routing reason:
    - `low_victim_confidence`
    - `duplicate_incident`
    - `campaign_report`
@@ -144,13 +152,15 @@ If canonical URL or fingerprint already exists, the article is skipped.
    - `legal_followup`
    - `opinion`
    - `out_of_taxonomy`
-6. At end of run, send one digest email (if enabled) with queued items grouped by reason.
+7. At end of run, send one digest email (if enabled) with queued items grouped by reason.
 
 ## False Positive Controls
 
 - Article-type gating blocks press releases, legal recaps, advisories, and opinion pieces from immediate channel.
+- Cyber-scope gating suppresses non-cyber stories that only contain generic words such as `attack`.
 - Confidence thresholds enforce both incident context and victim quality.
-- Incident-key dedupe suppresses syndicated wire rewrites from immediate channel.
+- Incident-key and TF-IDF dedupe suppress syndicated wire rewrites and source-title variants.
+- Victim extraction rejects generic users, product fragments, sentence spillover, and reporting-time fragments.
 - Digest routing preserves visibility while keeping immediate alerts conservative.
 
 ## Sample Outputs
@@ -196,7 +206,7 @@ PYTHONPATH=. pytest -q
 
 ## Limitations
 
-- Heuristic extraction remains deterministic and can mislabel edge-case stories.
+- Heuristic extraction remains deterministic and can miss edge-case victims by design.
 - Abstract quality still depends on source HTML structure and metadata quality.
 - Schema initialization is idempotent but is not a full migration system.
 - Closed taxonomy intentionally routes some real incidents to digest as `out_of_taxonomy`.

@@ -13,7 +13,9 @@ from app.dedup.deduplicator import (
     build_content_hash,
     build_fingerprint,
     build_incident_key,
+    build_similarity_document,
     canonicalize_url,
+    find_near_duplicate,
 )
 from app.detection.attack_classifier import AttackClassifier
 from app.detection.victim_extractor import VictimExtractor
@@ -46,6 +48,13 @@ class _DigestQueueEntry:
     item: DigestEmailItem
 
 
+@dataclass(frozen=True)
+class _NearDuplicateResult:
+    article_id: int
+    score: float
+    title: str
+
+
 class MonitorPipeline:
     def __init__(
         self,
@@ -56,6 +65,11 @@ class MonitorPipeline:
         emailer: Emailer,
         min_victim_confidence: float = 0.65,
         incident_dedupe_window_hours: int = 48,
+        near_duplicate_enabled: bool = True,
+        near_duplicate_threshold: float = 0.78,
+        near_duplicate_lookback_hours: int | None = None,
+        near_duplicate_max_comparisons: int = 500,
+        suppress_out_of_scope_digest: bool = True,
         digest_enabled: bool = True,
         digest_recipient_email: str | None = None,
         digest_max_items_per_run: int = 100,
@@ -67,6 +81,11 @@ class MonitorPipeline:
         self.emailer = emailer
         self.min_victim_confidence = min_victim_confidence
         self.incident_dedupe_window_hours = incident_dedupe_window_hours
+        self.near_duplicate_enabled = near_duplicate_enabled
+        self.near_duplicate_threshold = near_duplicate_threshold
+        self.near_duplicate_lookback_hours = near_duplicate_lookback_hours or incident_dedupe_window_hours
+        self.near_duplicate_max_comparisons = near_duplicate_max_comparisons
+        self.suppress_out_of_scope_digest = suppress_out_of_scope_digest
         self.digest_enabled = digest_enabled
         self.digest_recipient_email = digest_recipient_email or emailer.recipient_email
         self.digest_max_items_per_run = digest_max_items_per_run
@@ -122,6 +141,45 @@ class MonitorPipeline:
                 metrics.errors,
             )
 
+        fingerprint = build_fingerprint(item.title, content.full_text)
+        content_hash = build_content_hash(content.full_text)
+
+        with self.database.session() as session:
+            content_hash_exists = session.scalar(select(Article.id).where(Article.content_hash == content_hash))
+            if content_hash_exists:
+                logger.info(
+                    "Duplicate content hash detected, skipping url=%s existing_article_id=%s",
+                    item.url,
+                    content_hash_exists,
+                )
+                return PipelineMetrics(
+                    metrics.processed + 1,
+                    metrics.alerts_sent,
+                    metrics.digest_sent,
+                    metrics.digest_queued,
+                    metrics.skipped + 1,
+                    metrics.errors,
+                )
+
+        if self.near_duplicate_enabled:
+            near_duplicate = self._find_near_duplicate(item.title, content.abstract, content.full_text, item.published_at)
+            if near_duplicate is not None:
+                logger.info(
+                    "Near duplicate detected, skipping url=%s matched_article_id=%s score=%.3f matched_title=%s",
+                    item.url,
+                    near_duplicate.article_id,
+                    near_duplicate.score,
+                    near_duplicate.title,
+                )
+                return PipelineMetrics(
+                    metrics.processed + 1,
+                    metrics.alerts_sent,
+                    metrics.digest_sent,
+                    metrics.digest_queued,
+                    metrics.skipped + 1,
+                    metrics.errors,
+                )
+
         classification = self.classifier.classify(item.title, content.full_text)
         victim = self.victim_extractor.extract(item.title, content.full_text)
 
@@ -146,12 +204,10 @@ class MonitorPipeline:
         )
         routing_reason = self._routing_reason(classification.article_type, classification.attack_type, has_confident_victim, duplicate_incident)
 
-        fingerprint = build_fingerprint(item.title, content.full_text)
-        content_hash = build_content_hash(content.full_text)
-
         article_id: int | None = None
         alert_id: int | None = None
         digest_item: DigestEmailItem | None = None
+        suppressed_out_of_scope = False
 
         with self.database.session() as session:
             fp_exists = session.scalar(
@@ -216,7 +272,14 @@ class MonitorPipeline:
                         error_message=None,
                     )
                 else:
-                    digest_subject = f"Digest queued: {routing_reason}"
+                    suppressed_out_of_scope = (
+                        routing_reason == "out_of_scope" and self.suppress_out_of_scope_digest
+                    )
+                    digest_subject = (
+                        f"Digest skipped: {routing_reason}"
+                        if suppressed_out_of_scope
+                        else f"Digest queued: {routing_reason}"
+                    )
                     digest_body = (
                         f"Title: {item.title}\n"
                         f"Source: {item.source_name}\n"
@@ -226,8 +289,17 @@ class MonitorPipeline:
                         f"Published date: {self._published_date(item.published_at)}\n"
                         f"Article link: {item.url}\n"
                     )
-                    status = "queued" if self.digest_enabled and len(digest_queue) < self.digest_max_items_per_run else "skipped"
-                    digest_reason = routing_reason if status == "queued" else "digest_overflow_or_disabled"
+                    if suppressed_out_of_scope:
+                        status = "skipped"
+                    elif self.digest_enabled and len(digest_queue) < self.digest_max_items_per_run:
+                        status = "queued"
+                    else:
+                        status = "skipped"
+                    digest_reason = (
+                        routing_reason
+                        if status == "queued" or suppressed_out_of_scope
+                        else "digest_overflow_or_disabled"
+                    )
                     alert = Alert(
                         article_id=article.id,
                         recipient_email=self.digest_recipient_email,
@@ -269,7 +341,7 @@ class MonitorPipeline:
             metrics.alerts_sent,
             metrics.digest_sent,
             metrics.digest_queued + (1 if digest_item else 0),
-            metrics.skipped,
+            metrics.skipped + (1 if suppressed_out_of_scope else 0),
             metrics.errors,
         )
 
@@ -349,6 +421,61 @@ class MonitorPipeline:
             if abs(self._ensure_utc(candidate_time) - reference) <= window:
                 return True
         return False
+
+    def _find_near_duplicate(
+        self,
+        title: str,
+        abstract: str,
+        text: str,
+        candidate_time: datetime | None,
+    ) -> _NearDuplicateResult | None:
+        if self.near_duplicate_max_comparisons <= 0:
+            return None
+
+        with self.database.session() as session:
+            rows = session.execute(
+                select(
+                    Article.id,
+                    Article.title,
+                    Article.abstract,
+                    Article.article_text,
+                    Article.published_at,
+                    Article.created_at,
+                )
+                .order_by(Article.created_at.desc())
+                .limit(self.near_duplicate_max_comparisons)
+            ).all()
+
+        if not rows:
+            return None
+
+        candidate_reference = self._ensure_utc(candidate_time)
+        window = timedelta(hours=self.near_duplicate_lookback_hours)
+        existing_documents: list[str] = []
+        existing_metadata: list[tuple[int, str]] = []
+
+        for article_id, existing_title, existing_abstract, existing_text, published_at, created_at in rows:
+            if candidate_reference is not None:
+                reference = self._ensure_utc(published_at or created_at)
+                if reference is not None and abs(candidate_reference - reference) > window:
+                    continue
+
+            existing_documents.append(
+                build_similarity_document(existing_title, existing_abstract, existing_text)
+            )
+            existing_metadata.append((article_id, existing_title))
+
+        candidate_document = build_similarity_document(title, abstract, text)
+        match = find_near_duplicate(
+            candidate_document,
+            existing_documents,
+            threshold=self.near_duplicate_threshold,
+        )
+        if match is None:
+            return None
+
+        article_id, matched_title = existing_metadata[match.index]
+        return _NearDuplicateResult(article_id=article_id, score=match.score, title=matched_title)
 
     def _flush_digest_queue(
         self,

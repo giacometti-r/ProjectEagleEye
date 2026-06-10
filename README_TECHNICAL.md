@@ -58,7 +58,7 @@ Scope excludes `.git` internals and cache artifacts (for example `__pycache__`, 
 - `fetch/article_fetcher.py`: HTTP download, article text extraction, abstract generation.
 - `detection/attack_classifier.py`: article type + attack taxonomy classification.
 - `detection/victim_extractor.py`: victim entity extraction and categorization.
-- `dedup/deduplicator.py`: canonical URL + fingerprint + incident/content hash utilities.
+- `dedup/deduplicator.py`: canonical URL + fingerprint + incident/content hash + TF-IDF similarity utilities.
 - `sources/base.py`: source datamodel/protocol.
 - `sources/rss.py`: RSS adapter with Google News URL decoding support.
 - `sources/google_news.py`: Google News RSS specialization.
@@ -94,7 +94,7 @@ Execution starts at `app.main.main()`:
 3. `Database(settings)` creates SQLAlchemy engine/session factory.
 4. `initialize_schema(database)` creates tables and applies idempotent compatibility DDL.
 5. `Emailer(...)`, `ArticleFetcher(...)`, `AttackClassifier()`, `VictimExtractor(...)` are constructed.
-6. `MonitorPipeline(...)` is constructed with quality thresholds and channel controls.
+6. `MonitorPipeline(...)` is constructed with quality thresholds, near-duplicate controls, and channel controls.
 7. `gather_articles(settings)` instantiates sources and fetches candidate `SourceArticle` items.
 8. `pipeline.run(articles)` processes all candidates and returns `PipelineMetrics`.
 9. Final metrics are logged and process returns exit code `0`.
@@ -115,31 +115,35 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 
 1. Canonical URL dedupe check (`canonicalize_url` + DB lookup on `Article.canonical_url`).
 2. Remote article fetch and parse (`ArticleFetcher.fetch`), skip on failure/no text/no abstract.
-3. Classification (`AttackClassifier.classify`).
-4. Victim extraction (`VictimExtractor.extract`).
-5. Incident key creation (`build_incident_key`) when attack + victim available.
-6. Cross-incident dedupe window check (`_has_recent_incident_duplicate`).
-7. Immediate eligibility decision (`immediate_ready`) using article type + taxonomy + victim confidence + duplicate status.
-8. Fingerprint/content hash generation (`build_fingerprint`, `build_content_hash`).
-9. Transactional persistence of `Article`, `ArticleFingerprint`, and `Alert` row.
-10. Immediate channel: send SMTP mail now, then update alert `status`/`error_message`.
-11. Digest channel: queue item for run-level digest flush.
+3. Fingerprint/content hash generation (`build_fingerprint`, `build_content_hash`).
+4. Exact content hash dedupe check against stored articles.
+5. Optional near-duplicate check using TF-IDF cosine similarity over normalized title, abstract, and article-text prefix.
+6. Classification (`AttackClassifier.classify`), including cyber-scope gating.
+7. Victim extraction (`VictimExtractor.extract`) with conservative noise rejection.
+8. Incident key creation (`build_incident_key`) when attack + victim available.
+9. Cross-incident dedupe window check (`_has_recent_incident_duplicate`).
+10. Immediate eligibility decision (`immediate_ready`) using article type + taxonomy + victim confidence + duplicate status.
+11. Transactional persistence of `Article`, `ArticleFingerprint`, and `Alert` row.
+12. Immediate channel: send SMTP mail now, then update alert `status`/`error_message`.
+13. Digest channel: queue item for run-level digest flush unless suppressed as out-of-scope.
 
 ### 3.4 Channel Semantics
 
 - Immediate channel (`channel='immediate'`): only qualified incidents.
 - Digest channel (`channel='digest'`): non-immediate items or suppressed incidents.
+- Out-of-scope items are persisted with digest `status='skipped'` and are not sent when `suppress_out_of_scope_digest=true`.
 - Digest send occurs once at run end in `_flush_digest_queue`.
 - Alert status transitions:
   - immediate pending -> sent|failed
-  - digest queued -> sent|failed (on flush), or stored as skipped when disabled/overflow.
+  - digest queued -> sent|failed (on flush), or stored as skipped when disabled, overflow, or out-of-scope suppression applies.
 
 ### 3.5 Dedupe Layers
 
 1. Canonical URL dedupe (`articles.canonical_url` unique).
-2. Fingerprint dedupe (`article_fingerprints.fingerprint` unique).
-3. Incident-window dedupe (`articles.incident_key` + temporal comparison).
-4. Content hash (`articles.content_hash`) stored for audit/analysis (not hard-unique).
+2. Exact content hash dedupe (`articles.content_hash` lookup).
+3. Near-duplicate dedupe (`TfidfVectorizer` + cosine similarity over recent stored articles).
+4. Fingerprint dedupe (`article_fingerprints.fingerprint` unique).
+5. Incident-window dedupe (`articles.incident_key` + temporal comparison).
 
 ### 3.6 Scheduling and Operations
 
@@ -224,6 +228,11 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 | `google_news_queries` | `GOOGLE_NEWS_QUERIES` | `list[str]` | no | `DEFAULT_GOOGLE_NEWS_QUERIES` | `_parse_list_env` | Instantiates `GoogleNewsRssSource` entries. |
 | `min_victim_confidence` | `MIN_VICTIM_CONFIDENCE` | `float` | no | `0.65` | `float(...)` | Threshold for immediate-channel eligibility. |
 | `incident_dedupe_window_hours` | `INCIDENT_DEDUPE_WINDOW_HOURS` | `int` | no | `48` | `int(...)` | Time window for incident-key suppression. |
+| `near_duplicate_enabled` | `NEAR_DUPLICATE_ENABLED` | `bool` | no | `true` | truthy set | Enables TF-IDF cosine near-duplicate skips. |
+| `near_duplicate_threshold` | `NEAR_DUPLICATE_THRESHOLD` | `float` | no | `0.78` | `float(...)` | Minimum cosine score for near-duplicate skip. |
+| `near_duplicate_lookback_hours` | `NEAR_DUPLICATE_LOOKBACK_HOURS` | `int \| None` | no | fallback to incident window | optional `int(...)` | Time window for candidate comparison. |
+| `near_duplicate_max_comparisons` | `NEAR_DUPLICATE_MAX_COMPARISONS` | `int` | no | `500` | `int(...)` | Max recent articles loaded for similarity comparison. |
+| `suppress_out_of_scope_digest` | `SUPPRESS_OUT_OF_SCOPE_DIGEST` | `bool` | no | `true` | truthy set | Stores but does not send out-of-scope digest items. |
 | `digest_enabled` | `DIGEST_ENABLED` | `bool` | no | `true` | truthy set | Enables final digest flush/send. |
 | `digest_recipient_email` | `DIGEST_RECIPIENT_EMAIL` | `str` | conditional | fallback to `RECIPIENT_EMAIL` | strip + fallback | Recipient for digest alerts. |
 | `digest_max_items_per_run` | `DIGEST_MAX_ITEMS_PER_RUN` | `int` | no | `100` | `int(...)` | Cap on queued digest items. |
@@ -388,11 +397,16 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 - Fields: `alert_id`, `item: DigestEmailItem`.
 - Purpose: binds persisted digest alert row to later digest email payload.
 
+#### `_NearDuplicateResult` (`@dataclass(frozen=True)`)
+
+- Fields: `article_id`, `score`, `title`.
+- Purpose: carries the best TF-IDF cosine match for logging and skip decisions.
+
 #### `MonitorPipeline`
 
 Constructor:
 
-`__init__(database, fetcher, classifier, victim_extractor, emailer, min_victim_confidence=0.65, incident_dedupe_window_hours=48, digest_enabled=True, digest_recipient_email=None, digest_max_items_per_run=100)`
+`__init__(database, fetcher, classifier, victim_extractor, emailer, min_victim_confidence=0.65, incident_dedupe_window_hours=48, near_duplicate_enabled=True, near_duplicate_threshold=0.78, near_duplicate_lookback_hours=None, near_duplicate_max_comparisons=500, suppress_out_of_scope_digest=True, digest_enabled=True, digest_recipient_email=None, digest_max_items_per_run=100)`
 
 - Purpose: inject all collaborators and policy controls.
 
@@ -404,6 +418,8 @@ Methods:
 
 - `_process_one(item, digest_queue, metrics) -> PipelineMetrics`
   - Full per-article flow (dedupe, fetch, classify, extract, persist, send/queue).
+  - Skips exact content-hash duplicates and near-duplicates before classification.
+  - Stores out-of-scope articles as skipped digest alerts when suppression is enabled.
   - Handles DB duplicate races via `IntegrityError` rollback and skip accounting.
   - Immediate send failures do not increment `errors`; they mark alert row as `failed`.
 
@@ -414,6 +430,11 @@ Methods:
 - `_has_recent_incident_duplicate(incident_key, candidate_time) -> bool`
   - Finds prior articles with same incident key and compares UTC time delta to configured window.
   - If candidate time is missing but matches exist, returns `True` conservatively.
+
+- `_find_near_duplicate(title, abstract, text, candidate_time) -> _NearDuplicateResult | None`
+  - Loads recent stored articles up to `near_duplicate_max_comparisons`.
+  - Applies `near_duplicate_lookback_hours` when candidate time is known.
+  - Uses `build_similarity_document()` and `find_near_duplicate()` to find the best match.
 
 - `_flush_digest_queue(digest_queue, metrics) -> PipelineMetrics`
   - Sends one digest email when enabled and queue non-empty.
@@ -481,6 +502,15 @@ Methods:
 
 - Purpose: query params stripped during canonicalization (`utm_*`, `gclid`, `fbclid`).
 
+#### `SOURCE_SUFFIX_RE`, `SIMILARITY_PUNCT_RE`
+
+- Purpose: normalize source-suffixed titles and punctuation before TF-IDF vectorization.
+
+#### `SimilarityMatch` (`@dataclass(frozen=True)`)
+
+- Fields: `index`, `score`.
+- Purpose: reports the matching document index and cosine score for near-duplicate detection.
+
 #### `normalize_incident_entity(value: str) -> str`
 
 - Lowercases, strips punctuation to spaces, compacts whitespace.
@@ -509,8 +539,28 @@ Methods:
 
 #### `build_content_hash(text: str) -> str`
 
-- Purpose: normalized full-text hash for audit analysis.
+- Purpose: normalized full-text hash for exact duplicate skips and audit analysis.
 - Output: SHA-256 hex digest.
+
+#### `build_similarity_document(title: str, abstract: str, text: str, text_prefix_chars=4000) -> str`
+
+- Purpose: build the normalized text passed to TF-IDF similarity matching.
+- Behavior:
+  - Removes common trailing source suffixes from titles.
+  - Repeats normalized title to weight headline similarity.
+  - Includes abstract and a configurable article-text prefix.
+
+#### `find_near_duplicate(candidate_document, existing_documents, threshold) -> SimilarityMatch | None`
+
+- Purpose: detect near-duplicate articles with `TfidfVectorizer` and cosine similarity.
+- Behavior:
+  - Uses English stop words and unigram/bigram features.
+  - Returns the best match only when score is at least `threshold`.
+  - Returns `None` for empty corpora or empty vectorizer vocabularies.
+
+#### `_normalize_similarity_text(text: str) -> str`
+
+- Purpose: lowercase, remove URLs/punctuation, and compact whitespace for similarity documents.
 
 ## 6.6 `app/detection/attack_classifier.py`
 
@@ -538,10 +588,14 @@ Methods:
     - `press_release`
     - `legal_followup`
     - `opinion`
+    - `out_of_scope`
 - `SENTENCE_SPLIT_RE`
   - Sentence splitter regex.
 - `INCIDENT_PATTERNS`, `CAMPAIGN_PATTERNS`, `ADVISORY_PATTERNS`, `PRESS_RELEASE_PATTERNS`, `LEGAL_FOLLOWUP_PATTERNS`, `OPINION_PATTERNS`
   - Weighted cue families used for article type scoring.
+- `CYBER_SCOPE_PATTERNS`
+  - Strong cyber/security terms required before article-type routing proceeds.
+  - Prevents generic physical/political `attack` stories from entering digest.
 
 #### `ClassificationResult` (`@dataclass(frozen=True)`)
 
@@ -557,8 +611,9 @@ Methods:
   - Builds lead/body views.
   - Detects best attack type and confidence.
   - Scores article-type cue groups.
+  - Applies a cyber-scope gate before assigning in-scope article types.
   - Applies ordered decision rules to assign one article type.
-  - Adds explanatory reason tokens, including out-of-taxonomy marker when incident has no attack type.
+  - Adds explanatory reason tokens, including `out-of-scope` or out-of-taxonomy markers.
 
 - `_build_lead(text) -> str`
   - First four sentences, clipped to 1500 chars.
@@ -570,6 +625,9 @@ Methods:
 - `_score_patterns(patterns, title, lead, body) -> float`
   - Generic weighted pattern score helper (title=0.5, lead=0.3, body=0.2 per match).
 
+- `_has_cyber_scope(title, lead, body) -> bool`
+  - Returns true when strong cyber/security terms are present in title, lead, or early body.
+
 ## 6.7 `app/detection/victim_extractor.py`
 
 #### Constants and Pattern Objects
@@ -578,7 +636,8 @@ Methods:
 - `VICTIM_PATTERNS`: regex patterns capturing potential victim phrase spans.
 - `STOP_TOKENS`: low-signal banned single-token candidates.
 - `GENERIC_ENTITY_TERMS`: generic nouns rejected as victims.
-- `NOISE_PATTERNS`: navigation/language/domain noise detectors.
+- `PRODUCT_FRAGMENT_TERMS`: product/technology fragments rejected as victims.
+- `NOISE_PATTERNS`: navigation/language/domain, sentence-spillover, and reporting-time noise detectors.
 
 #### `VictimResult` (`@dataclass(frozen=True)`)
 
@@ -602,7 +661,7 @@ Methods:
   - Trims punctuation/whitespace, length-checks, rejects stop tokens.
 
 - `_noise_reason(candidate) -> str | None`
-  - Rejects candidates for too many words, generic entities, nav noise, dash noise, digit noise.
+  - Rejects candidates for too many words, generic entities, product fragments, nav noise, sentence spillover, reporting-time fragments, dash noise, and digit noise.
 
 - `_score_candidate(name, category, source_weight) -> float`
   - Builds confidence score with bonuses for name shape and non-company category.
@@ -759,6 +818,14 @@ This section maps each test symbol to the production behavior it validates.
   - Validates whitespace normalization invariance of `build_fingerprint`.
 - `test_incident_key_is_stable_for_case_and_punctuation()`
   - Validates case/punctuation invariance of `build_incident_key`.
+- `test_content_hash_is_stable_for_whitespace_changes()`
+  - Validates exact content duplicate hash stability.
+- `test_similarity_matches_exact_repeated_title()`
+  - Confirms repeated digest titles are detected as near-duplicates.
+- `test_similarity_matches_source_suffix_title_variant()`
+  - Confirms source-suffix title variants are detected as near-duplicates.
+- `test_similarity_does_not_match_unrelated_advisories()`
+  - Confirms unrelated advisory headlines remain distinct at the default threshold.
 
 ## 7.2 `tests/test_emailer.py`
 
@@ -785,6 +852,12 @@ This section maps each test symbol to the production behavior it validates.
   - Confirms press-release classification and non-attack semantics.
 - `test_flags_out_of_taxonomy_incident()`
   - Confirms incident can be detected while `attack_type` is `None` and reason includes `out-of-taxonomy`.
+- `test_flags_non_cyber_attack_story_out_of_scope()`
+  - Confirms generic non-cyber attack stories are suppressed as out-of-scope.
+- `test_flags_physical_war_attack_story_out_of_scope()`
+  - Confirms physical/war attack headlines are not treated as cyber news.
+- `test_classifies_vulnerability_advisory_as_in_scope()`
+  - Confirms vulnerability/zero-day advisories remain in-scope even without an attack taxonomy label.
 
 ## 7.4 `tests/test_victim_extractor.py`
 
@@ -796,6 +869,14 @@ This section maps each test symbol to the production behavior it validates.
   - Confirms title-priority extraction and reason `matched_title`.
 - `test_rejects_noisy_google_news_style_victim_candidate()`
   - Confirms noisy/generic candidate rejection and null-result reasons.
+- `test_rejects_sentence_spillover_victim_candidate()`
+  - Confirms candidates crossing sentence boundaries are rejected.
+- `test_rejects_reporting_time_fragment_victim_candidate()`
+  - Confirms fragments like `on Monday` do not become victims.
+- `test_rejects_product_fragment_victim_candidate()`
+  - Confirms product/technology names are not promoted to victims.
+- `test_rejects_generic_users_as_victim()`
+  - Confirms generic user/device targets are rejected.
 
 ## 7.5 `tests/test_article_fetcher.py`
 
@@ -815,11 +896,15 @@ This section maps each test symbol to the production behavior it validates.
 - `FakeFetcher`
   - `__init__(content)` stores fixed `ArticleContent`.
   - `fetch(url)` returns fixed payload.
+- `UrlMapFetcher(FakeFetcher)`
+  - Returns URL-specific `ArticleContent` to test dedupe behavior across multiple articles.
 - `FakeClassifier`
   - Nested dataclass `Result` mirrors production classifier output contract.
   - `classify(title, text)` returns deterministic phishing incident.
 - `OutOfTaxonomyClassifier(FakeClassifier)`
   - Overrides `classify` to return incident with `attack_type=None`.
+- `OutOfScopeClassifier(FakeClassifier)`
+  - Overrides `classify` to return `article_type='out_of_scope'`.
 - `FakeVictimExtractor`
   - Nested dataclass `Result` mirrors production victim output contract.
   - `extract(title, text)` returns deterministic high-confidence company victim.
@@ -847,6 +932,12 @@ This section maps each test symbol to the production behavior it validates.
   - Contract: incident without taxonomy attack routes to digest reason `out_of_taxonomy`.
 - `test_pipeline_marks_alert_failed_when_email_send_fails()`
   - Contract: immediate send exception sets alert status `failed` and stores error text without incrementing pipeline `errors` counter.
+- `test_pipeline_skips_exact_content_hash_duplicate()`
+  - Contract: identical fetched article bodies are stored/sent once even with different URLs.
+- `test_pipeline_skips_near_duplicate_before_digest_or_alert()`
+  - Contract: TF-IDF near-duplicates are skipped before immediate or digest routing.
+- `test_pipeline_suppresses_out_of_scope_digest_item()`
+  - Contract: out-of-scope articles are stored as skipped digest alerts and are not emailed.
 
 ---
 
@@ -865,6 +956,7 @@ Pinned dependencies and primary usage:
 - `tenacity`: retry policies for network calls.
 - `python-dateutil`: robust datetime parsing (`gdelt seendate`).
 - `pytest`: tests.
+- `scikit-learn`: TF-IDF vectorization and cosine similarity for near-duplicate detection.
 
 ## 8.2 `Dockerfile`
 
@@ -910,8 +1002,10 @@ Build behavior:
 ### Known Limits
 
 - Detection and extraction are deterministic heuristic systems; edge-case precision/recall tradeoffs remain.
+- Near-duplicate detection is lexical TF-IDF similarity, not semantic embeddings; paraphrases with little token overlap may still pass.
 - Schema initializer is compatibility-focused and not a full migration framework.
 - Immediate channel intentionally conservative (requires incident + taxonomy + confident victim + non-duplicate).
+- Out-of-scope items are skipped from digest by default but are still persisted for audit/dedupe continuity.
 - Digest queue truncates beyond `digest_max_items_per_run`; overflow items are stored as digest alerts with `routing_reason='digest_overflow_or_disabled'` and `status='skipped'`.
 - Google News entries may be dropped when decode is unavailable/fails to avoid consent/redirect URLs.
 
@@ -920,6 +1014,7 @@ Build behavior:
 - Add new source adapters implementing `NewsSource.fetch` shape.
 - Expand taxonomy by adding `ATTACK_PATTERNS` entries and adjusting classifier thresholds/rules.
 - Improve extraction robustness by tuning `VICTIM_PATTERNS`, noise filters, and confidence heuristics.
+- Tune duplicate sensitivity through `NEAR_DUPLICATE_THRESHOLD`, lookback, and comparison-count settings.
 - Introduce migration tooling (for example Alembic) to replace ad-hoc schema evolution in `initialize_schema`.
 - Add channel integrations by extending `Emailer` abstraction and `MonitorPipeline` alert dispatch branch.
 

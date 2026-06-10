@@ -26,6 +26,7 @@ ARTICLE_TYPE = Literal[
     "press_release",
     "legal_followup",
     "opinion",
+    "out_of_scope",
 ]
 
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -42,7 +43,7 @@ CAMPAIGN_PATTERNS = [
 ]
 
 ADVISORY_PATTERNS = [
-    re.compile(r"\b(patch tuesday|security updates?|emergency update|cve-\d{4}-\d+)\b", re.I),
+    re.compile(r"\b(patch(?:es|ed|ing)?|patch tuesday|security updates?|emergency update|cve-\d{4}-\d+|zero-day|0-day)\b", re.I),
     re.compile(r"\b(vulnerabilit(?:y|ies)|auth bypass|fixes?)\b", re.I),
 ]
 
@@ -59,6 +60,21 @@ LEGAL_FOLLOWUP_PATTERNS = [
 OPINION_PATTERNS = [
     re.compile(r"\b(how to|best practices|opinion|career|analysis)\b", re.I),
     re.compile(r"\b(without security is like|what you see is not all there is)\b", re.I),
+]
+
+CYBER_SCOPE_PATTERNS = [
+    re.compile(
+        (
+            r"\b(cyber(?:security|crime|attack|attacks)?|phishing|spearfishing|spear phishing|"
+            r"malware|ransomware|spyware|malvertising|smishing|vishing|credential(?:s)?|"
+            r"business email compromise|BEC|spoofing|impersonation|social engineering|"
+            r"vulnerabilit(?:y|ies)|exploit(?:ed|s)?|zero-day|0-day|cve-\d{4}-\d+|"
+            r"breach(?:ed)?|hacker(?:s)?|botnet|backdoor|wiper|remote code execution|RCE|"
+            r"patch tuesday|security update(?:s)?)\b"
+        ),
+        re.I,
+    ),
+    re.compile(r"\b(NSO Group|Pegasus|Qilin)\b", re.I),
 ]
 
 
@@ -91,11 +107,15 @@ class AttackClassifier:
         press_score = self._score_patterns(PRESS_RELEASE_PATTERNS, title, lead, body)
         legal_score = self._score_patterns(LEGAL_FOLLOWUP_PATTERNS, title, lead, body)
         opinion_score = self._score_patterns(OPINION_PATTERNS, title, lead, body)
+        in_cyber_scope = self._has_cyber_scope(title, lead, body)
 
         reasons: list[str] = []
-        if press_score >= 0.8:
+        if not in_cyber_scope:
+            reasons.append("out-of-scope")
+            article_type: ARTICLE_TYPE = "out_of_scope"
+        elif press_score >= 0.8:
             reasons.append("press-release-cues")
-            article_type: ARTICLE_TYPE = "press_release"
+            article_type = "press_release"
         elif legal_score >= 0.8:
             reasons.append("legal-followup-cues")
             article_type = "legal_followup"
@@ -178,3 +198,7 @@ class AttackClassifier:
             if pattern.search(body):
                 score += 0.2
         return min(score, 1.0)
+
+    def _has_cyber_scope(self, title: str, lead: str, body: str) -> bool:
+        corpus = f"{title} {lead} {body[:4000]}"
+        return any(pattern.search(corpus) for pattern in CYBER_SCOPE_PATTERNS)

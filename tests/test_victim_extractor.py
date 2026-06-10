@@ -48,3 +48,46 @@ def test_rejects_noisy_google_news_style_victim_candidate() -> None:
     assert result.victim_category is None
     assert result.confidence == 0.0
     assert result.reason in {"generic_entity", "noisy_candidate", "no_named_org"}
+
+
+def test_rejects_sentence_spillover_victim_candidate() -> None:
+    extractor = VictimExtractor()
+    result = extractor.extract(
+        "Microsoft patches Exchange Server zero-day exploited in attacks",
+        (
+            "Researchers described attacks against Outlook Web Access users. "
+            "This high-severity spoofing vulnerability was patched by Microsoft."
+        ),
+    )
+    assert result.victim_name is None
+    assert result.reason in {"noisy_candidate", "generic_entity", "no_named_org"}
+
+
+def test_rejects_reporting_time_fragment_victim_candidate() -> None:
+    extractor = VictimExtractor()
+    result = extractor.extract(
+        "Meta Stock: WhatsApp Takes Action Against NSO Group Spyware",
+        "Meta said it took action against NSO Group on Monday after spyware activity.",
+    )
+    assert result.victim_name is None
+    assert result.reason in {"noisy_candidate", "no_named_org"}
+
+
+def test_rejects_product_fragment_victim_candidate() -> None:
+    extractor = VictimExtractor()
+    result = extractor.extract(
+        "CISA gives feds 3 days to patch Check Point VPN bug exploited as zero-day",
+        "The advisory warned attacks against Mobile Access appliances could lead to compromise.",
+    )
+    assert result.victim_name is None
+    assert result.reason in {"noisy_candidate", "no_named_org"}
+
+
+def test_rejects_generic_users_as_victim() -> None:
+    extractor = VictimExtractor()
+    result = extractor.extract(
+        "Meta Accuses Pegasus Maker NSO Of Targeting WhatsApp Users To Hack Their Devices",
+        "The spyware firm was targeting WhatsApp Users To Hack Their Devices through phishing.",
+    )
+    assert result.victim_name is None
+    assert result.reason in {"generic_entity", "noisy_candidate", "no_named_org"}

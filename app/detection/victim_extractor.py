@@ -11,20 +11,36 @@ ORG_CUES = {
 }
 
 VICTIM_PATTERNS = [
-    re.compile(r"\b(?:targeted|attacked|compromised|breached)\s+([A-Z][\w&.\- ]{2,80})", re.I),
-    re.compile(r"\b([A-Z][\w&.\- ]{2,80})\s+(?:was|were)\s+(?:targeted|attacked|compromised|breached)", re.I),
-    re.compile(r"\bagainst\s+([A-Z][\w&.\- ]{2,80})", re.I),
-    re.compile(r"\btargeting\s+([A-Z][\w&.\- ]{2,80})", re.I),
-    re.compile(r"\battacks?\s+against\s+([A-Z][\w&.\- ]{2,80})", re.I),
-    re.compile(r"\b([A-Z][\w&.\- ]{2,80})\s+(?:was|were)\s+hit\s+by\b", re.I),
+    re.compile(r"\b(?i:targeted|attacked|compromised|breached)\s+([A-Z][\w&.'\- ]{2,80})"),
+    re.compile(r"\b([A-Z][\w&.'\- ]{2,80})\s+(?i:was|were)\s+(?i:targeted|attacked|compromised|breached)"),
+    re.compile(r"\b(?i:targeting)\s+([A-Z][\w&.'\- ]{2,80})"),
+    re.compile(r"\b(?i:attacks?)\s+(?i:against)\s+([A-Z][\w&.'\- ]{2,80})"),
+    re.compile(r"\b([A-Z][\w&.'\- ]{2,80})\s+(?i:was|were)\s+(?i:hit)\s+(?i:by)\b"),
 ]
 
 STOP_TOKENS = {"the", "a", "an", "this", "that", "these", "those", "phishing", "attack", "campaign"}
-GENERIC_ENTITY_TERMS = {"officials", "students", "staff", "users", "customers", "people", "citizens", "workers"}
+GENERIC_ENTITY_TERMS = {"officials", "students", "staff", "users", "customers", "people", "citizens", "workers", "devices"}
+PRODUCT_FRAGMENT_TERMS = {
+    "access",
+    "browser",
+    "chrome",
+    "exchange",
+    "outlook",
+    "server",
+    "servers",
+    "sentry",
+    "unifi",
+    "vpn",
+    "web",
+    "windows",
+}
 NOISE_PATTERNS = [
     re.compile(r"\b(menu|news search|write for us|share on|comment|lifestyle|fashion|film)\b", re.I),
     re.compile(r"\b(english|ukrainska|japanese)\b", re.I),
     re.compile(r"\.(com|net|org|co\.uk)\b", re.I),
+    re.compile(r"[.!?]\s+[A-Z]"),
+    re.compile(r"\b(on monday|on tuesday|on wednesday|on thursday|on friday|on saturday|on sunday)\b", re.I),
+    re.compile(r"\b(over new|to hack|violating court order|this high-severity)\b", re.I),
 ]
 
 
@@ -105,6 +121,8 @@ class VictimExtractor:
             return "too_many_words"
         if any(word.lower() in GENERIC_ENTITY_TERMS for word in words):
             return "generic_entity"
+        if any(word.lower().strip(".,:;") in PRODUCT_FRAGMENT_TERMS for word in words):
+            return "product_fragment"
         if any(pattern.search(candidate) for pattern in NOISE_PATTERNS):
             return "navigation_noise"
         if candidate.count(" - ") >= 1:

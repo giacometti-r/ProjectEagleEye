@@ -9,7 +9,7 @@ from app.alerts.emailer import AlertEmail, DigestEmailItem
 from app.config import Settings
 from app.db import Database
 from app.fetch.article_fetcher import ArticleContent
-from app.models import Alert
+from app.models import Alert, Article
 from app.pipeline import MonitorPipeline
 from app.schema_init import initialize_schema
 from app.sources.base import SourceArticle
@@ -21,6 +21,15 @@ class FakeFetcher:
 
     def fetch(self, url: str) -> ArticleContent | None:
         return self.content
+
+
+class UrlMapFetcher(FakeFetcher):
+    def __init__(self, content_by_url: dict[str, ArticleContent]) -> None:
+        self.content_by_url = content_by_url
+        super().__init__(ArticleContent(full_text="", abstract=""))
+
+    def fetch(self, url: str) -> ArticleContent | None:
+        return self.content_by_url[url]
 
 
 class FakeClassifier:
@@ -50,6 +59,17 @@ class OutOfTaxonomyClassifier(FakeClassifier):
             attack_confidence=0.2,
             incident_confidence=0.95,
             reasons=("out-of-taxonomy",),
+        )
+
+
+class OutOfScopeClassifier(FakeClassifier):
+    def classify(self, title: str, text: str) -> FakeClassifier.Result:
+        return self.Result(
+            article_type="out_of_scope",
+            attack_type=None,
+            attack_confidence=0.0,
+            incident_confidence=0.0,
+            reasons=("out-of-scope",),
         )
 
 
@@ -115,6 +135,11 @@ def _settings(db_url: str) -> Settings:
         google_news_queries=[],
         min_victim_confidence=0.65,
         incident_dedupe_window_hours=48,
+        near_duplicate_enabled=True,
+        near_duplicate_threshold=0.78,
+        near_duplicate_lookback_hours=None,
+        near_duplicate_max_comparisons=500,
+        suppress_out_of_scope_digest=True,
         digest_enabled=True,
         digest_recipient_email="digest@example.com",
         digest_max_items_per_run=100,
@@ -210,7 +235,18 @@ def test_pipeline_suppresses_duplicate_incident_into_digest() -> None:
     database = Database(_settings("sqlite+pysqlite:///:memory:"))
     initialize_schema(database)
 
-    fetcher = FakeFetcher(ArticleContent(full_text="attack text", abstract="first sentence. second sentence."))
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/one": ArticleContent(
+                full_text="initial phishing incident text",
+                abstract="first sentence. second sentence.",
+            ),
+            "https://example.com/two": ArticleContent(
+                full_text="follow up phishing incident text with new details",
+                abstract="follow up sentence. second sentence.",
+            ),
+        }
+    )
     emailer = FakeEmailer()
     pipeline = MonitorPipeline(
         database=database,
@@ -220,6 +256,7 @@ def test_pipeline_suppresses_duplicate_incident_into_digest() -> None:
         emailer=emailer,
         digest_enabled=True,
         digest_recipient_email="digest@example.com",
+        near_duplicate_enabled=False,
     )
 
     now = datetime.now(timezone.utc)
@@ -322,3 +359,140 @@ def test_pipeline_marks_alert_failed_when_email_send_fails() -> None:
         assert alert.channel == "immediate"
         assert alert.status == "failed"
         assert "smtp down" in (alert.error_message or "")
+
+
+def test_pipeline_skips_exact_content_hash_duplicate() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    content = ArticleContent(
+        full_text="Acme Corp phishing incident with identical article body.",
+        abstract="Acme Corp phishing incident.",
+    )
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/first": content,
+            "https://example.com/second": content,
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle("s1", "rss", "Acme Corp attacked in phishing", "https://example.com/first", now),
+            SourceArticle("s2", "rss", "Different title for same body", "https://example.com/second", now),
+        ]
+    )
+
+    assert metrics.alerts_sent == 1
+    assert metrics.skipped == 1
+    assert len(emailer.sent) == 1
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 1
+
+
+def test_pipeline_skips_near_duplicate_before_digest_or_alert() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/one": ArticleContent(
+                full_text="WhatsApp disrupted NSO spyware phishing attacks against users.",
+                abstract="WhatsApp disrupted NSO-linked spyware phishing attacks.",
+            ),
+            "https://example.com/two": ArticleContent(
+                full_text="Meta said WhatsApp disrupted new spyware phishing attacks linked to NSO Group.",
+                abstract="WhatsApp disrupted NSO-linked spyware phishing activity.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle(
+                "s1",
+                "rss",
+                "WhatsApp says it disrupted new NSO spyware phishing attacks - BleepingComputer",
+                "https://example.com/one",
+                now,
+            ),
+            SourceArticle(
+                "s2",
+                "rss",
+                "WhatsApp says it disrupted new NSO spyware phishing attacks",
+                "https://example.com/two",
+                now + timedelta(minutes=5),
+            ),
+        ]
+    )
+
+    assert metrics.alerts_sent == 1
+    assert metrics.skipped == 1
+    assert metrics.digest_queued == 0
+    assert len(emailer.sent) == 1
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 1
+
+
+def test_pipeline_suppresses_out_of_scope_digest_item() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = FakeFetcher(
+        ArticleContent(
+            full_text="The article discussed physical attacks and refugee policy.",
+            abstract="The article discussed physical attacks and refugee policy.",
+        )
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=OutOfScopeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        digest_enabled=True,
+        digest_recipient_email="digest@example.com",
+    )
+
+    article = SourceArticle(
+        source_name="s1",
+        source_type="rss",
+        title="Defiant Merkel defends refugee stance after attacks - Digital Journal",
+        url="https://example.com/merkel",
+        published_at=datetime.now(timezone.utc),
+    )
+
+    metrics = pipeline.run([article])
+    assert metrics.alerts_sent == 0
+    assert metrics.digest_queued == 0
+    assert metrics.digest_sent == 0
+    assert metrics.skipped == 1
+    assert len(emailer.sent) == 0
+
+    with database.session() as session:
+        alert = session.scalar(select(Alert))
+        assert alert is not None
+        assert alert.channel == "digest"
+        assert alert.routing_reason == "out_of_scope"
+        assert alert.status == "skipped"

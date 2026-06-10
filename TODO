@@ -1,3 +1,2 @@
 - Automatically save logs once CronJob completed
-- Some news articles were irrelevant (e.g "Defiant merkel defends refugee stance after attacks" probably got triggered because of the word attacks)
 - Run security audit
