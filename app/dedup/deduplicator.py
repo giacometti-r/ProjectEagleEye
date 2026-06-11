@@ -87,8 +87,8 @@ def build_similarity_document(title: str, abstract: str, text: str, text_prefix_
     return " ".join(
         part
         for part in (
-            normalized_title,
-            normalized_title,
+            #normalized_title,
+            #normalized_title,
             normalized_title,
             normalized_abstract,
             normalized_text,
