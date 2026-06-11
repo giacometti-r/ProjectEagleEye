@@ -80,7 +80,7 @@ def build_content_hash(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def build_similarity_document(title: str, abstract: str, text: str, text_prefix_chars: int = 4000) -> str:
+def build_similarity_document(title: str, abstract: str, text: str, text_prefix_chars: int = 2000) -> str:
     normalized_title = _normalize_similarity_text(SOURCE_SUFFIX_RE.sub("", title))
     normalized_abstract = _normalize_similarity_text(abstract)
     normalized_text = _normalize_similarity_text(text[:text_prefix_chars])
