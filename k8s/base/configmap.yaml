@@ -3,7 +3,7 @@ kind: ConfigMap
 metadata:
   name: cyber-news-alert-config
 data:
-  LOG_LEVEL: "DEBUG"
+  LOG_LEVEL: "INFO"
   REQUEST_TIMEOUT_SECONDS: "15"
   MAX_ARTICLES_PER_SOURCE: "50"
   ENABLE_GDELT: "true"
