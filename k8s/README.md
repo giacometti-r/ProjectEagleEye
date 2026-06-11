@@ -48,3 +48,22 @@ Render the manifests with KSOPS enabled:
 kubectl kustomize --enable-alpha-plugins --enable-exec k8s/overlays/prod \
   | kubectl apply --dry-run=client -f -
 ```
+
+## Recent database cleanup
+
+Use `scripts/cleanup_recent_db_entries.sh` to reset recent dedupe and alert
+state while testing. The script targets rows inserted in the last `DAYS`
+day(s), based on `articles.created_at`, and includes related `alerts` and
+`article_fingerprints` rows.
+
+Dry-run first:
+
+```bash
+scripts/cleanup_recent_db_entries.sh 3
+```
+
+Delete after checking the dry-run counts:
+
+```bash
+scripts/cleanup_recent_db_entries.sh 3 --execute
+```
