@@ -67,3 +67,18 @@ Delete after checking the dry-run counts:
 ```bash
 scripts/cleanup_recent_db_entries.sh 3 --execute
 ```
+
+For parser-related dedupe incidents, prefer a targeted dry-run query before
+using the broad recent cleanup. Rows affected by the June 2026 Cyber Express
+extraction bug can be found by looking for popup/page-chrome markers:
+
+```sql
+SELECT id, title, url, created_at
+FROM articles
+WHERE abstract ILIKE '%Unlock left%'
+   OR article_text ILIKE 'Home Cyber News Previous Post%';
+```
+
+After confirming the rows, delete matching `alerts`, `article_fingerprints`,
+and `articles` rows in one transaction, or let them age out of the relevant
+dedupe lookback windows.

@@ -129,6 +129,7 @@ def _settings(db_url: str) -> Settings:
         log_level="INFO",
         request_timeout_seconds=5,
         max_articles_per_source=10,
+        max_article_age_hours=168,
         enable_gdelt=False,
         gdelt_query_window_minutes=180,
         rss_feeds=[],
@@ -143,6 +144,9 @@ def _settings(db_url: str) -> Settings:
         digest_enabled=True,
         digest_recipient_email="digest@example.com",
         digest_max_items_per_run=100,
+        digest_topic_dedupe_enabled=True,
+        digest_topic_dedupe_threshold=0.30,
+        digest_topic_dedupe_lookback_hours=168,
         abstract_max_chars=420,
         max_victim_words=8,
     )
@@ -404,10 +408,11 @@ def test_pipeline_current_run_near_duplicates_both_survive_when_disabled() -> No
         database=database,
         fetcher=fetcher,
         classifier=FakeClassifier(),
-        victim_extractor=FakeVictimExtractor(),
+        victim_extractor=LowConfidenceVictimExtractor(),
         emailer=emailer,
         near_duplicate_enabled=False,
         digest_recipient_email="digest@example.com",
+        digest_topic_dedupe_enabled=False,
     )
 
     now = datetime.now(timezone.utc)
@@ -431,11 +436,11 @@ def test_pipeline_current_run_near_duplicates_both_survive_when_disabled() -> No
     )
 
     assert metrics.processed == 2
-    assert metrics.alerts_sent == 1
-    assert metrics.digest_queued == 1
+    assert metrics.alerts_sent == 0
+    assert metrics.digest_queued == 2
     assert metrics.digest_sent == 1
     assert metrics.skipped == 0
-    assert len(emailer.sent) == 2
+    assert len(emailer.sent) == 1
 
     with database.session() as session:
         assert len(session.scalars(select(Article)).all()) == 2
@@ -532,7 +537,7 @@ def test_pipeline_routes_low_confidence_victim_to_digest() -> None:
         assert alert.status == "sent"
 
 
-def test_pipeline_suppresses_duplicate_incident_into_digest() -> None:
+def test_pipeline_skips_duplicate_incident_without_digest() -> None:
     database = Database(_settings("sqlite+pysqlite:///:memory:"))
     initialize_schema(database)
 
@@ -580,16 +585,139 @@ def test_pipeline_suppresses_duplicate_incident_into_digest() -> None:
 
     metrics = pipeline.run(articles)
     assert metrics.alerts_sent == 1
-    assert metrics.digest_queued == 1
-    assert metrics.digest_sent == 1
-    assert len(emailer.sent) == 2
+    assert metrics.digest_queued == 0
+    assert metrics.digest_sent == 0
+    assert metrics.skipped == 1
+    assert len(emailer.sent) == 1
 
     with database.session() as session:
         alerts = session.scalars(select(Alert).order_by(Alert.id)).all()
-        assert len(alerts) == 2
+        articles = session.scalars(select(Article).order_by(Article.id)).all()
+        assert len(articles) == 1
+        assert len(alerts) == 1
         assert alerts[0].channel == "immediate"
-        assert alerts[1].channel == "digest"
-        assert alerts[1].routing_reason == "duplicate_incident"
+
+
+def test_pipeline_skips_digest_topic_duplicate() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/meta-one": ArticleContent(
+                full_text="Meta said NSO spyware operators targeted WhatsApp users with one-click phishing attempts.",
+                abstract="Meta said NSO spyware operators targeted WhatsApp users with one-click phishing attempts.",
+            ),
+            "https://example.com/meta-two": ArticleContent(
+                full_text="These attempts were similar to previous one-click phishing campaigns aimed at WhatsApp users.",
+                abstract="These attempts were similar to previous one-click phishing campaigns aimed at WhatsApp users.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        digest_enabled=True,
+        digest_recipient_email="digest@example.com",
+        near_duplicate_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle(
+                "first",
+                "rss",
+                "Meta to take legal action against Israeli spyware company NSO - Al Jazeera",
+                "https://example.com/meta-one",
+                now + timedelta(minutes=10),
+            ),
+            SourceArticle(
+                "second",
+                "rss",
+                "Meta takes legal action against Israeli spyware firm NSO - The Straits Times",
+                "https://example.com/meta-two",
+                now,
+            ),
+        ]
+    )
+
+    assert metrics.processed == 2
+    assert metrics.alerts_sent == 0
+    assert metrics.digest_queued == 1
+    assert metrics.digest_sent == 1
+    assert metrics.skipped == 1
+    assert len(emailer.sent) == 1
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        alerts = session.scalars(select(Alert)).all()
+        assert len(articles) == 1
+        assert len(alerts) == 1
+        assert articles[0].url == "https://example.com/meta-one"
+
+
+def test_pipeline_keeps_digest_items_with_only_generic_title_overlap() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/teams": ArticleContent(
+                full_text="Microsoft Teams will add warnings for suspicious brand impersonation calls.",
+                abstract="Microsoft Teams will add warnings for suspicious brand impersonation calls.",
+            ),
+            "https://example.com/exchange": ArticleContent(
+                full_text="Microsoft released Exchange Server security updates for an exploited zero-day vulnerability.",
+                abstract="Microsoft released Exchange Server security updates for an exploited zero-day vulnerability.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        digest_enabled=True,
+        digest_recipient_email="digest@example.com",
+        near_duplicate_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle(
+                "first",
+                "rss",
+                "Microsoft Teams to add brand impersonation warnings to calls",
+                "https://example.com/teams",
+                now,
+            ),
+            SourceArticle(
+                "second",
+                "rss",
+                "Microsoft patches Exchange Server zero-day exploited in attacks",
+                "https://example.com/exchange",
+                now + timedelta(minutes=10),
+            ),
+        ]
+    )
+
+    assert metrics.processed == 2
+    assert metrics.alerts_sent == 0
+    assert metrics.digest_queued == 2
+    assert metrics.digest_sent == 1
+    assert metrics.skipped == 0
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 2
+        assert len(session.scalars(select(Alert)).all()) == 2
 
 
 def test_pipeline_routes_out_of_taxonomy_to_digest() -> None:

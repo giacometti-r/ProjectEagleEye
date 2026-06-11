@@ -107,7 +107,7 @@ Execution starts at `app.main.main()`:
 - `GoogleNewsRssSource` per `google_news_queries` entry.
 - Optional `GdeltSource` when `enable_gdelt=true`.
 
-Source failures are isolated (`try/except` per source, warning logged). All collected articles are sorted newest-first using `published_at` (UTC), with Unix epoch fallback for missing timestamps.
+Source failures are isolated (`try/except` per source, warning logged). Dated items older than `max_article_age_hours` are dropped before article fetch; missing timestamps are retained. Remaining articles are sorted newest-first using `published_at` (UTC), with Unix epoch fallback for missing timestamps.
 
 ### 3.3 Pipeline Flow
 
@@ -127,14 +127,16 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
    - Victim extraction (`VictimExtractor.extract`) with conservative noise rejection.
    - Incident key creation (`build_incident_key`) when attack + victim available.
    - Cross-incident dedupe window check (`_has_recent_incident_duplicate`).
+   - Duplicate incidents are skipped before persistence.
    - Immediate eligibility decision using article type + taxonomy + victim confidence + duplicate status.
+   - Digest-bound topic duplicate check using title + abstract similarity and shared salient title terms.
    - Transactional persistence of `Article`, `ArticleFingerprint`, and `Alert` row.
    - Immediate SMTP send or digest queueing, followed by one run-level digest flush.
 
 ### 3.4 Channel Semantics
 
 - Immediate channel (`channel='immediate'`): only qualified incidents.
-- Digest channel (`channel='digest'`): non-immediate items or suppressed incidents.
+- Digest channel (`channel='digest'`): non-immediate, non-duplicate items.
 - Out-of-scope items are persisted with digest `status='skipped'` and are not sent when `suppress_out_of_scope_digest=true`.
 - Digest send occurs once at run end in `_flush_digest_queue`.
 - Alert status transitions:
@@ -143,13 +145,15 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 
 ### 3.5 Dedupe Layers
 
-1. Stored canonical URL dedupe (`articles.canonical_url` unique).
-2. Stored exact content hash dedupe (`articles.content_hash` lookup).
-3. Stored fingerprint dedupe (`article_fingerprints.fingerprint` unique).
-4. Stored near-duplicate dedupe (`TfidfVectorizer` + cosine similarity over recent stored articles).
-5. Current-run exact dedupe by canonical URL, content hash, and fingerprint.
-6. Current-run near-duplicate dedupe using the same similarity threshold/window settings.
-7. Incident-window dedupe (`articles.incident_key` + temporal comparison).
+1. Source freshness filter (`max_article_age_hours`, missing timestamps retained).
+2. Stored canonical URL dedupe (`articles.canonical_url` unique).
+3. Stored exact content hash dedupe (`articles.content_hash` lookup).
+4. Stored fingerprint dedupe (`article_fingerprints.fingerprint` unique).
+5. Stored near-duplicate dedupe (`TfidfVectorizer` + cosine similarity over recent stored articles).
+6. Current-run exact dedupe by canonical URL, content hash, and fingerprint.
+7. Current-run near-duplicate dedupe using the same similarity threshold/window settings.
+8. Incident-window dedupe (`articles.incident_key` + temporal comparison).
+9. Digest-topic dedupe (`TfidfVectorizer` over title + abstract plus salient title-overlap guard).
 
 ### 3.6 Scheduling and Operations
 
@@ -229,6 +233,7 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 | `log_level` | `LOG_LEVEL` | `str` | no | `INFO` | uppercased | Global logging level. |
 | `request_timeout_seconds` | `REQUEST_TIMEOUT_SECONDS` | `int` | no | `15` | `int(...)` | HTTP timeout for article/GDELT fetch. |
 | `max_articles_per_source` | `MAX_ARTICLES_PER_SOURCE` | `int` | no | `50` | `int(...)` | Upper bound per source adapter fetch. |
+| `max_article_age_hours` | `MAX_ARTICLE_AGE_HOURS` | `int` | no | `168` | `int(...)` | Drops dated source items older than this before fetch; `0` disables. |
 | `enable_gdelt` | `ENABLE_GDELT` | `bool` | no | `true` | truthy set `{1,true,yes}` | Enables/disables GDELT source. |
 | `gdelt_query_window_minutes` | `GDELT_QUERY_WINDOW_MINUTES` | `int` | no | `180` | `int(...)` | GDELT time window (`timespan`). |
 | `rss_feeds` | `RSS_FEEDS` | `list[str]` | no | `DEFAULT_RSS_FEEDS` | `_parse_list_env` | Instantiates `RssSource` entries. |
@@ -243,6 +248,9 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 | `digest_enabled` | `DIGEST_ENABLED` | `bool` | no | `true` | truthy set | Enables final digest flush/send. |
 | `digest_recipient_email` | `DIGEST_RECIPIENT_EMAIL` | `str` | conditional | fallback to `RECIPIENT_EMAIL` | strip + fallback | Recipient for digest alerts. |
 | `digest_max_items_per_run` | `DIGEST_MAX_ITEMS_PER_RUN` | `int` | no | `100` | `int(...)` | Cap on queued digest items. |
+| `digest_topic_dedupe_enabled` | `DIGEST_TOPIC_DEDUPE_ENABLED` | `bool` | no | `true` | truthy set | Enables topic-level duplicate skips for digest-bound items. |
+| `digest_topic_dedupe_threshold` | `DIGEST_TOPIC_DEDUPE_THRESHOLD` | `float` | no | `0.30` | `float(...)` | Minimum title+abstract cosine score for digest-topic duplicate candidates. |
+| `digest_topic_dedupe_lookback_hours` | `DIGEST_TOPIC_DEDUPE_LOOKBACK_HOURS` | `int` | no | fallback to `MAX_ARTICLE_AGE_HOURS` | `int(...)` | Time window for stored digest-topic comparisons. |
 | `abstract_max_chars` | `ABSTRACT_MAX_CHARS` | `int` | no | `420` | `int(...)` | Max abstract length for article summaries. |
 | `max_victim_words` | `MAX_VICTIM_WORDS` | `int` | no | `8` | `int(...)` | Victim extractor candidate/finalization word limit. |
 
@@ -348,6 +356,16 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 - Object: module logger via `logging.getLogger(__name__)`.
 - Used for source fetch warnings and run completion metrics.
 
+#### `_ensure_utc(value: datetime | None) -> datetime | None`
+
+- Purpose: normalize source timestamps for freshness filtering and sorting.
+- Output: UTC-aware datetime or `None`.
+
+#### `_filter_fresh_articles(articles, max_age_hours) -> list[SourceArticle]`
+
+- Purpose: drop dated source items older than the configured freshness window before body fetch/classification.
+- Behavior: `max_age_hours <= 0` disables filtering; missing timestamps are retained.
+
 #### `gather_articles(settings: object) -> list[SourceArticle]`
 
 - Purpose: construct sources from settings and aggregate articles.
@@ -357,6 +375,7 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 - Side effects:
   - Network calls through source adapters.
   - Optional GDELT query mirrors the scoped social-engineering terms used by Google News defaults and avoids bare `impersonation`.
+  - Logs dropped stale item count when source freshness filtering removes items.
   - Warning logs on per-source failure.
 - Failure behavior:
   - Individual source exceptions are swallowed with warning.
@@ -410,6 +429,11 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 - Fields: `article_id`, `score`, `title`.
 - Purpose: carries the best TF-IDF cosine match for logging and skip decisions.
 
+#### `_TopicDuplicateResult` (`@dataclass(frozen=True)`)
+
+- Fields: `article_id`, `score`, `title`, `shared_title_terms`.
+- Purpose: carries the best digest-topic duplicate match for logging and skip decisions.
+
 #### `_FetchedCandidate` (`@dataclass(frozen=True)`)
 
 - Fields: `item`, `content`, `canonical_url`, `fingerprint`, `content_hash`, `similarity_document`, `original_index`.
@@ -419,7 +443,7 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 
 Constructor:
 
-`__init__(database, fetcher, classifier, victim_extractor, emailer, min_victim_confidence=0.65, incident_dedupe_window_hours=48, near_duplicate_enabled=True, near_duplicate_threshold=0.78, near_duplicate_lookback_hours=None, near_duplicate_max_comparisons=500, suppress_out_of_scope_digest=True, digest_enabled=True, digest_recipient_email=None, digest_max_items_per_run=100)`
+`__init__(database, fetcher, classifier, victim_extractor, emailer, min_victim_confidence=0.65, incident_dedupe_window_hours=48, near_duplicate_enabled=True, near_duplicate_threshold=0.78, near_duplicate_lookback_hours=None, near_duplicate_max_comparisons=500, suppress_out_of_scope_digest=True, digest_enabled=True, digest_recipient_email=None, digest_max_items_per_run=100, digest_topic_dedupe_enabled=True, digest_topic_dedupe_threshold=0.30, digest_topic_dedupe_lookback_hours=168)`
 
 - Purpose: inject all collaborators and policy controls.
 
@@ -448,6 +472,8 @@ Methods:
 - `_process_prepared(candidate, digest_queue, metrics) -> PipelineMetrics`
   - Full survivor flow (classify, extract, incident dedupe, persist, send/queue).
   - Keeps final canonical/content-hash/fingerprint DB guards for concurrent-run races.
+  - Skips duplicate incidents before persistence instead of queueing them into digest.
+  - Skips non-immediate digest-topic duplicates before persistence.
   - Stores out-of-scope articles as skipped digest alerts when suppression is enabled.
   - Handles DB duplicate races via `IntegrityError` rollback and skip accounting.
   - Immediate send failures do not increment `errors`; they mark alert row as `failed`.
@@ -459,6 +485,11 @@ Methods:
 - `_has_recent_incident_duplicate(incident_key, candidate_time) -> bool`
   - Finds prior articles with same incident key and compares UTC time delta to configured window.
   - If candidate time is missing but matches exist, returns `True` conservatively.
+
+- `_find_digest_topic_duplicate(title, abstract, candidate_time) -> _TopicDuplicateResult | None`
+  - Loads recent stored articles up to `near_duplicate_max_comparisons`.
+  - Applies `digest_topic_dedupe_lookback_hours` when candidate time is known.
+  - Uses `find_topic_duplicate()` over title + abstract and requires shared salient title terms.
 
 - `_find_near_duplicate(title, abstract, text, candidate_time) -> _NearDuplicateResult | None`
   - Loads recent stored articles up to `near_duplicate_max_comparisons`.
@@ -581,8 +612,20 @@ Methods:
 - Purpose: build the normalized text passed to TF-IDF similarity matching.
 - Behavior:
   - Removes common trailing source suffixes from titles.
-  - Includes normalized title and abstract.
-  - Normalizes the configurable article-text prefix but does not currently include it in the returned document.
+  - Includes normalized title, abstract, and configurable article-text prefix.
+
+#### `build_topic_document(title: str, abstract: str) -> str`
+
+- Purpose: build the title-weighted normalized text used for digest-topic duplicate matching.
+- Behavior: source suffix removal, topic-token normalization, and title repetition to weight headlines.
+
+#### `salient_title_tokens(title: str) -> set[str]`
+
+- Purpose: extract non-generic normalized headline terms for topic duplicate evidence.
+
+#### `shared_salient_title_terms(left_title, right_title) -> tuple[str, ...]`
+
+- Purpose: require at least two shared salient terms or sufficient title-token Jaccard overlap before topic duplicate suppression.
 
 #### `find_near_duplicate(candidate_document, existing_documents, threshold) -> SimilarityMatch | None`
 
@@ -591,6 +634,14 @@ Methods:
   - Uses English stop words and unigram/bigram features.
   - Returns the best match only when score is at least `threshold`.
   - Returns `None` for empty corpora or empty vectorizer vocabularies.
+
+#### `find_topic_duplicate(candidate_title, candidate_abstract, existing_items, threshold) -> TopicDuplicateMatch | None`
+
+- Purpose: detect digest-topic duplicates with lower title+abstract similarity plus salient-title overlap.
+- Behavior:
+  - Uses English stop words and unigram/bigram features over `build_topic_document()`.
+  - Checks candidate matches from highest to lowest score.
+  - Returns the first score above threshold that also has shared salient title terms.
 
 #### `find_near_duplicate_pairs(documents, threshold) -> list[SimilarityPair]`
 
@@ -602,6 +653,10 @@ Methods:
 #### `_normalize_similarity_text(text: str) -> str`
 
 - Purpose: lowercase, remove URLs/punctuation, and compact whitespace for similarity documents.
+
+#### `_normalize_topic_text(text: str) -> str`
+
+- Purpose: apply topic-token aliases such as patch/patching, flaw/vulnerability, and govt/federal normalization.
 
 ## 6.6 `app/detection/attack_classifier.py`
 
@@ -875,6 +930,10 @@ This section maps each test symbol to the production behavior it validates.
   - Confirms source-suffix title variants are detected as near-duplicates.
 - `test_similarity_does_not_match_unrelated_advisories()`
   - Confirms unrelated advisory headlines remain distinct at the default threshold.
+- `test_topic_duplicate_matches_digest_rewrite_examples()`
+  - Confirms digest-topic matching catches representative Meta/NSO, CISA, tax phishing, and UNC3753 rewrites.
+- `test_topic_duplicate_requires_salient_title_overlap()`
+  - Confirms generic overlap such as shared vendor/security terms is insufficient for topic suppression.
 
 ## 7.2 `tests/test_emailer.py`
 
@@ -991,8 +1050,12 @@ This section maps each test symbol to the production behavior it validates.
   - Contract: duplicate losers create no `Article`/`Alert` rows and do not appear in the digest email body.
 - `test_pipeline_routes_low_confidence_victim_to_digest()`
   - Contract: low-confidence victim routes to digest with reason `low_victim_confidence`, digest sent once.
-- `test_pipeline_suppresses_duplicate_incident_into_digest()`
-  - Contract: second same-incident story within window routes to digest reason `duplicate_incident`.
+- `test_pipeline_skips_duplicate_incident_without_digest()`
+  - Contract: second same-incident story within window is skipped without an `Article`/`Alert` row.
+- `test_pipeline_skips_digest_topic_duplicate()`
+  - Contract: non-immediate same-topic digest rewrites are skipped before persistence.
+- `test_pipeline_keeps_digest_items_with_only_generic_title_overlap()`
+  - Contract: digest topic dedupe does not suppress unrelated items sharing only generic title terms.
 - `test_pipeline_routes_out_of_taxonomy_to_digest()`
   - Contract: incident without taxonomy attack routes to digest reason `out_of_taxonomy`.
 - `test_pipeline_marks_alert_failed_when_email_send_fails()`

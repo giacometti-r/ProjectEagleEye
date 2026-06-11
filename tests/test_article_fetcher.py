@@ -90,6 +90,43 @@ def test_extract_text_handles_tag_with_missing_attrs_dict() -> None:
     assert "Acme Corp was attacked in a phishing incident" in text
 
 
+def test_extract_text_prefers_entry_content_with_no_share_class() -> None:
+    fetcher = ArticleFetcher(timeout_seconds=5, abstract_max_chars=180)
+    article_body = (
+        "A newly identified cyber extortion operation is gaining attention among incident responders after "
+        "security researchers uncovered a threat group using voice phishing, cloud data theft and aggressive "
+        "extortion tactics to target organizations. "
+    ) * 4
+    soup = BeautifulSoup(
+        (
+            "<html><body>"
+            "<div class='latest-news'>Unlock left : 0 Yes No Are you sure want to cancel subscription?</div>"
+            "<div class='entry-content no-share'><p>"
+            f"{article_body}"
+            "</p></div>"
+            "<div class='newsletter-signup'>Subscribe to our newsletter</div>"
+            "</body></html>"
+        ),
+        "html.parser",
+    )
+
+    text = fetcher._extract_text(soup)
+
+    assert text.startswith("A newly identified cyber extortion operation")
+    assert "Unlock left" not in text
+    assert "Subscribe to our newsletter" not in text
+
+
+def test_extract_abstract_rejects_subscription_popup_noise() -> None:
+    fetcher = ArticleFetcher(timeout_seconds=5, abstract_max_chars=180)
+    abstract = fetcher._extract_abstract(
+        "Unlock left : 0 Yes No Are you sure want to cancel subscription? Queue Update Required Flash plugin.",
+        metadata_abstract="Researchers reported a cyber extortion operation targeting Microsoft 365 data.",
+    )
+
+    assert abstract == "Researchers reported a cyber extortion operation targeting Microsoft 365 data."
+
+
 def test_validate_public_http_url_rejects_non_http_schemes() -> None:
     with pytest.raises(UnsafeUrlError):
         validate_public_http_url("file:///etc/passwd", require_dns_resolution=False)

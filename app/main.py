@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.alerts.emailer import Emailer
 from app.config import load_settings
@@ -18,6 +18,34 @@ from app.sources.google_news import GoogleNewsRssSource
 from app.sources.rss import RssSource
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _filter_fresh_articles(articles: list[SourceArticle], max_age_hours: int) -> list[SourceArticle]:
+    if max_age_hours <= 0:
+        return articles
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    fresh_articles = [
+        article
+        for article in articles
+        if (published_at := _ensure_utc(article.published_at)) is None or published_at >= cutoff
+    ]
+    dropped = len(articles) - len(fresh_articles)
+    if dropped:
+        logger.info(
+            "Dropped stale source articles count=%s max_article_age_hours=%s",
+            dropped,
+            max_age_hours,
+        )
+    return fresh_articles
 
 
 def gather_articles(settings: object) -> list[SourceArticle]:
@@ -57,9 +85,11 @@ def gather_articles(settings: object) -> list[SourceArticle]:
         except Exception as exc:
             logger.warning("Source fetch failed source=%s error=%s", source.__class__.__name__, exc)
 
+    all_articles = _filter_fresh_articles(all_articles, cfg.max_article_age_hours)
+
     # Enforce newest-first processing even when upstream feed/API ordering differs.
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    all_articles.sort(key=lambda x: x.published_at or epoch, reverse=True)
+    all_articles.sort(key=lambda x: _ensure_utc(x.published_at) or epoch, reverse=True)
 
     return all_articles
 
@@ -99,6 +129,9 @@ def main() -> int:
         digest_enabled=settings.digest_enabled,
         digest_recipient_email=settings.digest_recipient_email,
         digest_max_items_per_run=settings.digest_max_items_per_run,
+        digest_topic_dedupe_enabled=settings.digest_topic_dedupe_enabled,
+        digest_topic_dedupe_threshold=settings.digest_topic_dedupe_threshold,
+        digest_topic_dedupe_lookback_hours=settings.digest_topic_dedupe_lookback_hours,
     )
 
     articles = gather_articles(settings)

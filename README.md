@@ -9,9 +9,10 @@ Python 3.11 service that monitors free cybersecurity news sources (RSS, Google N
 - Article-type gating: `incident`, `campaign_report`, `advisory`, `press_release`, `legal_followup`, `opinion`, `out_of_scope`.
 - Strict immediate alerting: immediate emails only for qualified incidents with in-taxonomy attack type and confident victim extraction.
 - Digest channel: one digest email per run for queued non-immediate items; clearly out-of-scope items are suppressed by default.
+- Source freshness filtering drops stale dated items before article fetch/classification.
 - Source queries and cyber-scope filters reject broad `impersonation`/`cybersecurity` matches unless they include digital threat context.
 - Cross-source incident dedupe: 48-hour incident-key dedupe to suppress syndicated rewrites in immediate channel.
-- TF-IDF cosine near-duplicate detection to skip syndicated/reworded articles before alerting.
+- TF-IDF cosine near-duplicate and digest-topic duplicate detection to skip syndicated/reworded articles before alerting.
 - Boilerplate-resistant article cleanup and improved abstract generation with metadata fallback.
 - URL/fingerprint/content-hash dedupe plus conservative victim extraction and robust retries/logging.
 
@@ -53,6 +54,7 @@ Optional runtime controls:
 - `LOG_LEVEL`
 - `REQUEST_TIMEOUT_SECONDS`
 - `MAX_ARTICLES_PER_SOURCE`
+- `MAX_ARTICLE_AGE_HOURS` (default: `168`, `0` disables)
 - `ENABLE_GDELT`
 - `GDELT_QUERY_WINDOW_MINUTES`
 - `RSS_FEEDS` (comma-separated or JSON array)
@@ -67,6 +69,9 @@ Optional runtime controls:
 - `DIGEST_ENABLED` (default: `true`)
 - `DIGEST_RECIPIENT_EMAIL` (default: fallback to `RECIPIENT_EMAIL`)
 - `DIGEST_MAX_ITEMS_PER_RUN` (default: `100`)
+- `DIGEST_TOPIC_DEDUPE_ENABLED` (default: `true`)
+- `DIGEST_TOPIC_DEDUPE_THRESHOLD` (default: `0.30`)
+- `DIGEST_TOPIC_DEDUPE_LOOKBACK_HOURS` (default: fallback to `MAX_ARTICLE_AGE_HOURS`)
 - `ABSTRACT_MAX_CHARS` (default: `420`)
 - `MAX_VICTIM_WORDS` (default: `8`)
 
@@ -123,15 +128,17 @@ This executes at minute 0 every hour.
 
 ## Deduplication Logic
 
-Each candidate article is deduplicated by:
+Each candidate article is freshness-filtered and deduplicated by:
 
-1. **Canonical URL**: strips tracking parameters (`utm_*`, `gclid`, `fbclid`) and normalizes URL parts.
-2. **Content hash**: SHA-256 over normalized full text to skip exact body duplicates.
-3. **TF-IDF cosine similarity**: compares normalized title + abstract + article-text prefix against recent stored articles to skip near-duplicates.
-4. **Fingerprint hash**: SHA-256 over normalized title + article text prefix.
-5. **Incident key (immediate channel only)**: SHA-256 over normalized `(victim + attack type)` with a time window (`INCIDENT_DEDUPE_WINDOW_HOURS`) to suppress same-victim incident follow-ups from immediate alerts.
+1. **Source freshness**: drops dated source items older than `MAX_ARTICLE_AGE_HOURS`; missing dates are retained.
+2. **Canonical URL**: strips tracking parameters (`utm_*`, `gclid`, `fbclid`) and normalizes URL parts.
+3. **Content hash**: SHA-256 over normalized full text to skip exact body duplicates.
+4. **TF-IDF cosine similarity**: compares normalized title + abstract + article-text prefix against recent stored articles to skip near-duplicates.
+5. **Fingerprint hash**: SHA-256 over normalized title + article text prefix.
+6. **Incident key**: SHA-256 over normalized `(victim + attack type)` with a time window (`INCIDENT_DEDUPE_WINDOW_HOURS`) to skip same-victim incident follow-ups.
+7. **Digest-topic similarity**: compares title + abstract for non-immediate items and requires shared salient headline terms before skipping.
 
-If canonical URL, content hash, near-duplicate similarity, or fingerprint already matches, the article is skipped.
+If canonical URL, content hash, near-duplicate similarity, fingerprint, incident key, or digest-topic similarity already matches, the article is skipped.
 
 ## Alert Qualification Flow (Two Channels)
 
@@ -144,9 +151,8 @@ If canonical URL, content hash, near-duplicate similarity, or fingerprint alread
    - in-taxonomy `attack_type` present
    - victim confidence >= `MIN_VICTIM_CONFIDENCE`
    - no incident-key duplicate within `INCIDENT_DEDUPE_WINDOW_HOURS`
-6. If immediate criteria fail, route to digest queue with routing reason:
+6. If immediate criteria fail, skip same-incident and digest-topic duplicates; otherwise route to digest queue with routing reason:
    - `low_victim_confidence`
-   - `duplicate_incident`
    - `campaign_report`
    - `advisory`
    - `press_release`
@@ -162,7 +168,7 @@ If canonical URL, content hash, near-duplicate similarity, or fingerprint alread
 - Bare `impersonation` is not enough for cyber scope; it must be tied to phishing, credentials, accounts, tech support scams, brand/employee/executive impersonation, deepfakes, voice cloning, BEC, or social engineering.
 - Explicit out-of-scope rules suppress local/offline fraud blotter, community awareness/meeting items, vendor partnership announcements, administrative identity checks, generic explainers, and bare site-index results.
 - Confidence thresholds enforce both incident context and victim quality.
-- Incident-key and TF-IDF dedupe suppress syndicated wire rewrites and source-title variants.
+- Incident-key, TF-IDF, and digest-topic dedupe suppress syndicated wire rewrites, source-title variants, and repeated digest topics.
 - Victim extraction rejects generic users, product fragments, sentence spillover, and reporting-time fragments.
 - Digest routing preserves visibility while keeping immediate alerts conservative.
 
@@ -211,6 +217,7 @@ PYTHONPATH=. pytest -q
 
 - Heuristic extraction remains deterministic and can miss edge-case victims by design.
 - Abstract quality still depends on source HTML structure and metadata quality.
+- Digest-topic dedupe is lexical and conservative; repeated topics with little title/abstract overlap can still appear.
 - Schema initialization is idempotent but is not a full migration system.
 - Closed taxonomy intentionally routes some real incidents to digest as `out_of_taxonomy`.
 - Scope filtering is heuristic; new noisy source patterns may require adding explicit out-of-scope rules.

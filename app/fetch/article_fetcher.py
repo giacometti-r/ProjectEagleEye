@@ -19,13 +19,42 @@ MEANINGFUL_SENTENCE_RE = re.compile(r"[A-Za-z]{3,}")
 NOISE_SENTENCE_RE = re.compile(
     (
         r"\b(menu|news search|share on|write for us|comment|features|lifestyle|fashion|film|"
-        r"whatsapp|linkedin|advertisement|subscribe|cookie policy|privacy policy|follow us)\b"
+        r"whatsapp|linkedin|advertisement|subscribe|cookie policy|privacy policy|follow us|"
+        r"unlock left|cancel subscription|queue update required|flash plugin)\b"
     ),
     re.I,
 )
-BOILERPLATE_ATTR_RE = re.compile(
-    r"(nav|menu|header|footer|promo|advert|ad-|share|social|cookie|newsletter|subscribe)",
-    re.I,
+BOILERPLATE_ATTR_TOKENS = {
+    "nav",
+    "menu",
+    "header",
+    "footer",
+    "promo",
+    "advert",
+    "advertisement",
+    "ad",
+    "share",
+    "social",
+    "cookie",
+    "newsletter",
+    "subscribe",
+}
+CONTENT_ATTR_VALUES = {
+    "article-body",
+    "article-content",
+    "entry-content",
+    "post-content",
+    "single-post-content",
+    "td-post-content",
+}
+ARTICLE_CONTENT_SELECTORS = (
+    ".entry-content",
+    ".post-content",
+    ".single-post-content",
+    ".td-post-content",
+    "[itemprop='articleBody']",
+    "article",
+    "main",
 )
 ALLOWED_CONTENT_TYPES = (
     "text/html",
@@ -147,35 +176,58 @@ class ArticleFetcher:
         for node in soup.find_all(True):
             attrs_obj = getattr(node, "attrs", None)
             if not isinstance(attrs_obj, dict):
+                node.attrs = {}
                 continue
 
-            node_id = attrs_obj.get("id") or ""
-            class_value = attrs_obj.get("class")
-            class_names = " ".join(class_value) if isinstance(class_value, list) else ""
-            attrs = " ".join(
-                [
-                    node_id,
-                    class_names,
-                ]
-            )
-            if BOILERPLATE_ATTR_RE.search(attrs):
+            if self._is_boilerplate_node(attrs_obj):
                 node.decompose()
 
-        candidates = []
-        for selector in ["article", "main", "div[itemprop='articleBody']", "body"]:
+        for selector in ARTICLE_CONTENT_SELECTORS:
+            candidates = []
             for node in soup.select(selector):
                 text = node.get_text(" ", strip=True)
                 if len(text) > 400:
                     candidates.append(text)
+            if candidates:
+                return self._normalize_extracted_text(max(candidates, key=len))
 
-        if not candidates:
-            candidates = [soup.get_text(" ", strip=True)]
+        body = soup.select_one("body")
+        fallback = body.get_text(" ", strip=True) if body else soup.get_text(" ", strip=True)
+        return self._normalize_extracted_text(fallback)
 
-        longest = max(candidates, key=len, default="")
-        normalized = re.sub(r"\s+", " ", unescape(longest)).strip()
+    def _normalize_extracted_text(self, text: str) -> str:
+        normalized = re.sub(r"\s+", " ", unescape(text)).strip()
         normalized = re.sub(r"\bAdvertisement\b", "", normalized, flags=re.I)
         normalized = re.sub(r"\s+", " ", normalized).strip()
         return normalized
+
+    def _is_boilerplate_node(self, attrs: dict[str, object]) -> bool:
+        values: list[str] = []
+        node_id = attrs.get("id")
+        if isinstance(node_id, str):
+            values.append(node_id)
+
+        class_value = attrs.get("class")
+        if isinstance(class_value, list):
+            values.extend(str(value) for value in class_value)
+        elif isinstance(class_value, str):
+            values.extend(class_value.split())
+
+        return any(self._is_boilerplate_attr_value(value) for value in values)
+
+    def _is_boilerplate_attr_value(self, value: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+        if not normalized:
+            return False
+        if normalized in CONTENT_ATTR_VALUES:
+            return False
+        if normalized.startswith(("entry-content", "post-content", "single-post-content", "td-post-content")):
+            return False
+        if normalized.startswith(("no-", "without-", "disable-", "disabled-")):
+            return False
+
+        tokens = [token for token in normalized.split("-") if token]
+        return any(token in BOILERPLATE_ATTR_TOKENS for token in tokens)
 
     def _extract_metadata_abstract(self, soup: BeautifulSoup) -> str:
         for key, value in (

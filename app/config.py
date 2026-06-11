@@ -33,6 +33,7 @@ class Settings:
     log_level: str
     request_timeout_seconds: int
     max_articles_per_source: int
+    max_article_age_hours: int
     enable_gdelt: bool
     gdelt_query_window_minutes: int
     rss_feeds: List[str]
@@ -47,6 +48,9 @@ class Settings:
     digest_enabled: bool
     digest_recipient_email: str
     digest_max_items_per_run: int
+    digest_topic_dedupe_enabled: bool
+    digest_topic_dedupe_threshold: float
+    digest_topic_dedupe_lookback_hours: int
     abstract_max_chars: int
     max_victim_words: int
 
@@ -92,6 +96,7 @@ def load_settings() -> Settings:
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         request_timeout_seconds=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "15")),
         max_articles_per_source=int(os.getenv("MAX_ARTICLES_PER_SOURCE", "50")),
+        max_article_age_hours=int(os.getenv("MAX_ARTICLE_AGE_HOURS", "168")),
         enable_gdelt=os.getenv("ENABLE_GDELT", "true").strip().lower() in {"1", "true", "yes"},
         gdelt_query_window_minutes=int(os.getenv("GDELT_QUERY_WINDOW_MINUTES", "180")),
         rss_feeds=_parse_list_env("RSS_FEEDS", DEFAULT_RSS_FEEDS),
@@ -113,6 +118,15 @@ def load_settings() -> Settings:
         digest_recipient_email=os.getenv("DIGEST_RECIPIENT_EMAIL", os.getenv("RECIPIENT_EMAIL", "")).strip()
         or _require("RECIPIENT_EMAIL"),
         digest_max_items_per_run=int(os.getenv("DIGEST_MAX_ITEMS_PER_RUN", "100")),
+        digest_topic_dedupe_enabled=os.getenv("DIGEST_TOPIC_DEDUPE_ENABLED", "true").strip().lower()
+        in {"1", "true", "yes"},
+        digest_topic_dedupe_threshold=float(os.getenv("DIGEST_TOPIC_DEDUPE_THRESHOLD", "0.30")),
+        digest_topic_dedupe_lookback_hours=int(
+            os.getenv(
+                "DIGEST_TOPIC_DEDUPE_LOOKBACK_HOURS",
+                os.getenv("MAX_ARTICLE_AGE_HOURS", "168"),
+            )
+        ),
         abstract_max_chars=int(os.getenv("ABSTRACT_MAX_CHARS", "420")),
         max_victim_words=int(os.getenv("MAX_VICTIM_WORDS", "8")),
     )

@@ -17,6 +17,7 @@ from app.dedup.deduplicator import (
     canonicalize_url,
     find_near_duplicate,
     find_near_duplicate_pairs,
+    find_topic_duplicate,
 )
 from app.detection.attack_classifier import AttackClassifier
 from app.detection.victim_extractor import VictimExtractor
@@ -57,6 +58,14 @@ class _NearDuplicateResult:
 
 
 @dataclass(frozen=True)
+class _TopicDuplicateResult:
+    article_id: int
+    score: float
+    title: str
+    shared_title_terms: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _FetchedCandidate:
     item: SourceArticle
     content: ArticleContent
@@ -85,6 +94,9 @@ class MonitorPipeline:
         digest_enabled: bool = True,
         digest_recipient_email: str | None = None,
         digest_max_items_per_run: int = 100,
+        digest_topic_dedupe_enabled: bool = True,
+        digest_topic_dedupe_threshold: float = 0.30,
+        digest_topic_dedupe_lookback_hours: int | None = 168,
     ) -> None:
         self.database = database
         self.fetcher = fetcher
@@ -101,6 +113,9 @@ class MonitorPipeline:
         self.digest_enabled = digest_enabled
         self.digest_recipient_email = digest_recipient_email or emailer.recipient_email
         self.digest_max_items_per_run = digest_max_items_per_run
+        self.digest_topic_dedupe_enabled = digest_topic_dedupe_enabled
+        self.digest_topic_dedupe_threshold = digest_topic_dedupe_threshold
+        self.digest_topic_dedupe_lookback_hours = digest_topic_dedupe_lookback_hours
 
     def run(self, articles: list[SourceArticle]) -> PipelineMetrics:
         metrics = PipelineMetrics()
@@ -339,6 +354,20 @@ class MonitorPipeline:
         duplicate_incident = False
         if classification.article_type == "incident" and classification.attack_type and incident_key:
             duplicate_incident = self._has_recent_incident_duplicate(incident_key, item.published_at)
+        if duplicate_incident:
+            logger.info(
+                "Duplicate incident detected, skipping url=%s incident_key=%s",
+                item.url,
+                incident_key,
+            )
+            return PipelineMetrics(
+                metrics.processed,
+                metrics.alerts_sent,
+                metrics.digest_sent,
+                metrics.digest_queued,
+                metrics.skipped + 1,
+                metrics.errors,
+            )
 
         immediate_ready = (
             classification.article_type == "incident"
@@ -347,6 +376,26 @@ class MonitorPipeline:
             and not duplicate_incident
         )
         routing_reason = self._routing_reason(classification.article_type, classification.attack_type, has_confident_victim, duplicate_incident)
+
+        if self.digest_topic_dedupe_enabled and not immediate_ready:
+            topic_duplicate = self._find_digest_topic_duplicate(item.title, content.abstract, item.published_at)
+            if topic_duplicate is not None:
+                logger.info(
+                    "Digest topic duplicate detected, skipping url=%s matched_article_id=%s score=%.3f matched_title=%s shared_title_terms=%s",
+                    item.url,
+                    topic_duplicate.article_id,
+                    topic_duplicate.score,
+                    topic_duplicate.title,
+                    ",".join(topic_duplicate.shared_title_terms),
+                )
+                return PipelineMetrics(
+                    metrics.processed,
+                    metrics.alerts_sent,
+                    metrics.digest_sent,
+                    metrics.digest_queued,
+                    metrics.skipped + 1,
+                    metrics.errors,
+                )
 
         article_id: int | None = None
         alert_id: int | None = None
@@ -592,6 +641,66 @@ class MonitorPipeline:
             if abs(self._ensure_utc(candidate_time) - reference) <= window:
                 return True
         return False
+
+    def _find_digest_topic_duplicate(
+        self,
+        title: str,
+        abstract: str,
+        candidate_time: datetime | None,
+    ) -> _TopicDuplicateResult | None:
+        if self.near_duplicate_max_comparisons <= 0:
+            return None
+
+        with self.database.session() as session:
+            rows = session.execute(
+                select(
+                    Article.id,
+                    Article.title,
+                    Article.abstract,
+                    Article.published_at,
+                    Article.created_at,
+                )
+                .order_by(Article.created_at.desc())
+                .limit(self.near_duplicate_max_comparisons)
+            ).all()
+
+        if not rows:
+            return None
+
+        candidate_reference = self._ensure_utc(candidate_time)
+        window = (
+            timedelta(hours=self.digest_topic_dedupe_lookback_hours)
+            if self.digest_topic_dedupe_lookback_hours and self.digest_topic_dedupe_lookback_hours > 0
+            else None
+        )
+        existing_items: list[tuple[str, str]] = []
+        existing_metadata: list[tuple[int, str]] = []
+
+        for article_id, existing_title, existing_abstract, published_at, created_at in rows:
+            if candidate_reference is not None and window is not None:
+                reference = self._ensure_utc(published_at or created_at)
+                if reference is not None and abs(candidate_reference - reference) > window:
+                    continue
+
+            existing_items.append((existing_title, existing_abstract))
+            existing_metadata.append((article_id, existing_title))
+
+        match = find_topic_duplicate(
+            title,
+            abstract,
+            existing_items,
+            threshold=self.digest_topic_dedupe_threshold,
+        )
+        if match is None:
+            return None
+
+        article_id, matched_title = existing_metadata[match.index]
+        return _TopicDuplicateResult(
+            article_id=article_id,
+            score=match.score,
+            title=matched_title,
+            shared_title_terms=match.shared_title_terms,
+        )
 
     def _find_near_duplicate(
         self,
