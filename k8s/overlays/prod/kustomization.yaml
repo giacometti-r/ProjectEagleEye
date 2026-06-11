@@ -8,4 +8,4 @@ generators:
 images:
 - name: ghcr.io/giacometti-r/projecteagleeye
   newName: ghcr.io/giacometti-r/projecteagleeye
-  newTag: 932c4a854b33d01e522d0bdf290687d373dbfd26
+  newTag: 489fcb244fd403cb116b2a265c3521b008a51a0e
