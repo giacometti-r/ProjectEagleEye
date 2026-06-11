@@ -16,6 +16,8 @@ spec:
             app.kubernetes.io/name: cyber-news-alert
             app.kubernetes.io/part-of: cyber-news-alert
         spec:
+          nodeSelector:
+            kubernetes.io/hostname: worker-node1
           serviceAccountName: cyber-news-alert
           restartPolicy: Never
           containers:
