@@ -109,23 +109,27 @@ Execution starts at `app.main.main()`:
 
 Source failures are isolated (`try/except` per source, warning logged). All collected articles are sorted newest-first using `published_at` (UTC), with Unix epoch fallback for missing timestamps.
 
-### 3.3 Per-Article Pipeline Flow
+### 3.3 Pipeline Flow
 
-`MonitorPipeline._process_one()` executes the processing graph:
+`MonitorPipeline.run()` executes the processing graph in three phases:
 
-1. Canonical URL dedupe check (`canonicalize_url` + DB lookup on `Article.canonical_url`).
-2. Remote article fetch and parse (`ArticleFetcher.fetch`), skip on failure/no text/no abstract.
-3. Fingerprint/content hash generation (`build_fingerprint`, `build_content_hash`).
-4. Exact content hash dedupe check against stored articles.
-5. Optional near-duplicate check using TF-IDF cosine similarity over normalized title, abstract, and article-text prefix.
-6. Classification (`AttackClassifier.classify`), including cyber-scope gating.
-7. Victim extraction (`VictimExtractor.extract`) with conservative noise rejection.
-8. Incident key creation (`build_incident_key`) when attack + victim available.
-9. Cross-incident dedupe window check (`_has_recent_incident_duplicate`).
-10. Immediate eligibility decision (`immediate_ready`) using article type + taxonomy + victim confidence + duplicate status.
-11. Transactional persistence of `Article`, `ArticleFingerprint`, and `Alert` row.
-12. Immediate channel: send SMTP mail now, then update alert `status`/`error_message`.
-13. Digest channel: queue item for run-level digest flush unless suppressed as out-of-scope.
+1. Candidate preparation for every fetched `SourceArticle`:
+   - Canonical URL DB dedupe check (`canonicalize_url` + DB lookup on `Article.canonical_url`).
+   - Remote article fetch and parse (`ArticleFetcher.fetch`), skip on failure.
+   - Fingerprint/content hash/similarity document generation.
+   - Exact content-hash, fingerprint, and optional near-duplicate DB checks.
+2. Current-run batch dedupe across prepared candidates:
+   - Groups exact matches by canonical URL, content hash, and fingerprint.
+   - Groups near-duplicates with TF-IDF cosine similarity when enabled.
+   - Keeps the newest `published_at`; ties and missing timestamps keep the earlier input order.
+3. Survivor processing:
+   - Classification (`AttackClassifier.classify`), including cyber-scope gating.
+   - Victim extraction (`VictimExtractor.extract`) with conservative noise rejection.
+   - Incident key creation (`build_incident_key`) when attack + victim available.
+   - Cross-incident dedupe window check (`_has_recent_incident_duplicate`).
+   - Immediate eligibility decision using article type + taxonomy + victim confidence + duplicate status.
+   - Transactional persistence of `Article`, `ArticleFingerprint`, and `Alert` row.
+   - Immediate SMTP send or digest queueing, followed by one run-level digest flush.
 
 ### 3.4 Channel Semantics
 
@@ -139,11 +143,13 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 
 ### 3.5 Dedupe Layers
 
-1. Canonical URL dedupe (`articles.canonical_url` unique).
-2. Exact content hash dedupe (`articles.content_hash` lookup).
-3. Near-duplicate dedupe (`TfidfVectorizer` + cosine similarity over recent stored articles).
-4. Fingerprint dedupe (`article_fingerprints.fingerprint` unique).
-5. Incident-window dedupe (`articles.incident_key` + temporal comparison).
+1. Stored canonical URL dedupe (`articles.canonical_url` unique).
+2. Stored exact content hash dedupe (`articles.content_hash` lookup).
+3. Stored fingerprint dedupe (`article_fingerprints.fingerprint` unique).
+4. Stored near-duplicate dedupe (`TfidfVectorizer` + cosine similarity over recent stored articles).
+5. Current-run exact dedupe by canonical URL, content hash, and fingerprint.
+6. Current-run near-duplicate dedupe using the same similarity threshold/window settings.
+7. Incident-window dedupe (`articles.incident_key` + temporal comparison).
 
 ### 3.6 Scheduling and Operations
 
@@ -404,6 +410,11 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 - Fields: `article_id`, `score`, `title`.
 - Purpose: carries the best TF-IDF cosine match for logging and skip decisions.
 
+#### `_FetchedCandidate` (`@dataclass(frozen=True)`)
+
+- Fields: `item`, `content`, `canonical_url`, `fingerprint`, `content_hash`, `similarity_document`, `original_index`.
+- Purpose: carries fetched article content and dedupe keys between preparation, current-run dedupe, and survivor processing.
+
 #### `MonitorPipeline`
 
 Constructor:
@@ -415,12 +426,28 @@ Constructor:
 Methods:
 
 - `run(articles: list[SourceArticle]) -> PipelineMetrics`
-  - Orchestrates per-item processing and final digest flush.
+  - Prepares fetched candidates, dedupes the current run in memory, processes survivors, and flushes digest.
+  - Counts every input article as processed; skips DB duplicates, fetch failures, and current-run duplicate losers.
   - Catches unhandled per-item exceptions, increments `errors`, continues run.
 
-- `_process_one(item, digest_queue, metrics) -> PipelineMetrics`
-  - Full per-article flow (dedupe, fetch, classify, extract, persist, send/queue).
-  - Skips exact content-hash duplicates and near-duplicates before classification.
+- `_prepare_candidate(item, original_index) -> _FetchedCandidate | None`
+  - Canonicalizes URL, checks stored canonical duplicates, fetches content, builds dedupe keys, and checks stored content-hash/fingerprint/near-duplicate matches.
+  - Returns `None` for skipped candidates before classification or persistence.
+
+- `_dedupe_current_run_candidates(candidates) -> tuple[list[_FetchedCandidate], int]`
+  - Groups prepared candidates by exact dedupe keys and optional near-duplicate similarity.
+  - Keeps the newest `published_at`; missing timestamps compare older than real timestamps, with input order as tie-breaker.
+  - Returns survivor candidates in original input order plus the duplicate loser count.
+
+- `_candidate_survivor_key(candidate) -> tuple[datetime, int]`
+  - Builds the current-run survivor priority key from UTC publication time and inverse input index.
+
+- `_within_near_duplicate_window(left, right) -> bool`
+  - Applies `near_duplicate_lookback_hours` to current-run near-duplicate pairs when both timestamps are known.
+
+- `_process_prepared(candidate, digest_queue, metrics) -> PipelineMetrics`
+  - Full survivor flow (classify, extract, incident dedupe, persist, send/queue).
+  - Keeps final canonical/content-hash/fingerprint DB guards for concurrent-run races.
   - Stores out-of-scope articles as skipped digest alerts when suppression is enabled.
   - Handles DB duplicate races via `IntegrityError` rollback and skip accounting.
   - Immediate send failures do not increment `errors`; they mark alert row as `failed`.
@@ -513,6 +540,11 @@ Methods:
 - Fields: `index`, `score`.
 - Purpose: reports the matching document index and cosine score for near-duplicate detection.
 
+#### `SimilarityPair` (`@dataclass(frozen=True)`)
+
+- Fields: `left_index`, `right_index`, `score`.
+- Purpose: reports a current-run document pair whose cosine score meets the near-duplicate threshold.
+
 #### `normalize_incident_entity(value: str) -> str`
 
 - Lowercases, strips punctuation to spaces, compacts whitespace.
@@ -549,8 +581,8 @@ Methods:
 - Purpose: build the normalized text passed to TF-IDF similarity matching.
 - Behavior:
   - Removes common trailing source suffixes from titles.
-  - Repeats normalized title to weight headline similarity.
-  - Includes abstract and a configurable article-text prefix.
+  - Includes normalized title and abstract.
+  - Normalizes the configurable article-text prefix but does not currently include it in the returned document.
 
 #### `find_near_duplicate(candidate_document, existing_documents, threshold) -> SimilarityMatch | None`
 
@@ -559,6 +591,13 @@ Methods:
   - Uses English stop words and unigram/bigram features.
   - Returns the best match only when score is at least `threshold`.
   - Returns `None` for empty corpora or empty vectorizer vocabularies.
+
+#### `find_near_duplicate_pairs(documents, threshold) -> list[SimilarityPair]`
+
+- Purpose: detect all current-run document pairs whose TF-IDF cosine score is at least `threshold`.
+- Behavior:
+  - Uses the same vectorizer settings as `find_near_duplicate()`.
+  - Returns an empty list for fewer than two usable documents or empty vectorizer vocabularies.
 
 #### `_normalize_similarity_text(text: str) -> str`
 
@@ -938,6 +977,18 @@ This section maps each test symbol to the production behavior it validates.
 
 - `test_pipeline_sends_once_for_canonical_duplicates()`
   - Contract: canonical duplicates produce one immediate send, one stored immediate alert marked `sent`.
+- `test_pipeline_current_run_canonical_duplicate_keeps_newest()`
+  - Contract: current-run canonical duplicates keep the newest published article and store/send only that survivor.
+- `test_pipeline_current_run_content_hash_duplicate_keeps_newest()`
+  - Contract: current-run exact content duplicates keep the newest published article.
+- `test_pipeline_current_run_fingerprint_duplicate_keeps_newest()`
+  - Contract: current-run fingerprint duplicates keep the newest published article even when content hashes differ.
+- `test_pipeline_current_run_near_duplicate_keeps_newest_when_enabled()`
+  - Contract: current-run TF-IDF near-duplicates keep the newest published article when near-duplicate detection is enabled.
+- `test_pipeline_current_run_near_duplicates_both_survive_when_disabled()`
+  - Contract: current-run near-duplicates both persist when near-duplicate detection is disabled.
+- `test_pipeline_current_run_duplicate_loser_is_not_persisted_or_in_digest()`
+  - Contract: duplicate losers create no `Article`/`Alert` rows and do not appear in the digest email body.
 - `test_pipeline_routes_low_confidence_victim_to_digest()`
   - Contract: low-confidence victim routes to digest with reason `low_victim_confidence`, digest sent once.
 - `test_pipeline_suppresses_duplicate_incident_into_digest()`

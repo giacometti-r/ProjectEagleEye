@@ -16,10 +16,11 @@ from app.dedup.deduplicator import (
     build_similarity_document,
     canonicalize_url,
     find_near_duplicate,
+    find_near_duplicate_pairs,
 )
 from app.detection.attack_classifier import AttackClassifier
 from app.detection.victim_extractor import VictimExtractor
-from app.fetch.article_fetcher import ArticleFetcher
+from app.fetch.article_fetcher import ArticleContent, ArticleFetcher
 from app.models import Alert, Article, ArticleFingerprint
 from app.sources.base import SourceArticle
 
@@ -53,6 +54,17 @@ class _NearDuplicateResult:
     article_id: int
     score: float
     title: str
+
+
+@dataclass(frozen=True)
+class _FetchedCandidate:
+    item: SourceArticle
+    content: ArticleContent
+    canonical_url: str
+    fingerprint: str
+    content_hash: str
+    similarity_document: str
+    original_index: int
 
 
 class MonitorPipeline:
@@ -93,12 +105,59 @@ class MonitorPipeline:
     def run(self, articles: list[SourceArticle]) -> PipelineMetrics:
         metrics = PipelineMetrics()
         digest_queue: list[_DigestQueueEntry] = []
+        candidates: list[_FetchedCandidate] = []
 
-        for item in articles:
+        for original_index, item in enumerate(articles):
             try:
-                metrics = self._process_one(item, digest_queue, metrics)
+                candidate = self._prepare_candidate(item, original_index)
             except Exception as exc:
                 logger.exception("Unhandled processing failure url=%s error=%s", item.url, exc)
+                metrics = PipelineMetrics(
+                    processed=metrics.processed + 1,
+                    alerts_sent=metrics.alerts_sent,
+                    digest_sent=metrics.digest_sent,
+                    digest_queued=metrics.digest_queued,
+                    skipped=metrics.skipped,
+                    errors=metrics.errors + 1,
+                )
+                continue
+
+            if candidate is None:
+                metrics = PipelineMetrics(
+                    metrics.processed + 1,
+                    metrics.alerts_sent,
+                    metrics.digest_sent,
+                    metrics.digest_queued,
+                    metrics.skipped + 1,
+                    metrics.errors,
+                )
+            else:
+                candidates.append(candidate)
+                metrics = PipelineMetrics(
+                    metrics.processed + 1,
+                    metrics.alerts_sent,
+                    metrics.digest_sent,
+                    metrics.digest_queued,
+                    metrics.skipped,
+                    metrics.errors,
+                )
+
+        survivors, duplicate_count = self._dedupe_current_run_candidates(candidates)
+        if duplicate_count:
+            metrics = PipelineMetrics(
+                metrics.processed,
+                metrics.alerts_sent,
+                metrics.digest_sent,
+                metrics.digest_queued,
+                metrics.skipped + duplicate_count,
+                metrics.errors,
+            )
+
+        for candidate in survivors:
+            try:
+                metrics = self._process_prepared(candidate, digest_queue, metrics)
+            except Exception as exc:
+                logger.exception("Unhandled processing failure url=%s error=%s", candidate.item.url, exc)
                 metrics = PipelineMetrics(
                     processed=metrics.processed,
                     alerts_sent=metrics.alerts_sent,
@@ -110,39 +169,21 @@ class MonitorPipeline:
 
         return self._flush_digest_queue(digest_queue, metrics)
 
-    def _process_one(
-        self,
-        item: SourceArticle,
-        digest_queue: list[_DigestQueueEntry],
-        metrics: PipelineMetrics,
-    ) -> PipelineMetrics:
+    def _prepare_candidate(self, item: SourceArticle, original_index: int) -> _FetchedCandidate | None:
         canonical_url = canonicalize_url(item.url)
 
         with self.database.session() as session:
             existing = session.scalar(select(Article.id).where(Article.canonical_url == canonical_url))
             if existing:
-                return PipelineMetrics(
-                    metrics.processed + 1,
-                    metrics.alerts_sent,
-                    metrics.digest_sent,
-                    metrics.digest_queued,
-                    metrics.skipped + 1,
-                    metrics.errors,
-                )
+                return None
 
         content = self.fetcher.fetch(item.url)
         if not content:
-            return PipelineMetrics(
-                metrics.processed + 1,
-                metrics.alerts_sent,
-                metrics.digest_sent,
-                metrics.digest_queued,
-                metrics.skipped + 1,
-                metrics.errors,
-            )
+            return None
 
         fingerprint = build_fingerprint(item.title, content.full_text)
         content_hash = build_content_hash(content.full_text)
+        similarity_document = build_similarity_document(item.title, content.abstract, content.full_text)
 
         with self.database.session() as session:
             content_hash_exists = session.scalar(select(Article.id).where(Article.content_hash == content_hash))
@@ -152,14 +193,14 @@ class MonitorPipeline:
                     item.url,
                     content_hash_exists,
                 )
-                return PipelineMetrics(
-                    metrics.processed + 1,
-                    metrics.alerts_sent,
-                    metrics.digest_sent,
-                    metrics.digest_queued,
-                    metrics.skipped + 1,
-                    metrics.errors,
-                )
+                return None
+
+            fp_exists = session.scalar(
+                select(ArticleFingerprint.id).where(ArticleFingerprint.fingerprint == fingerprint)
+            )
+            if fp_exists:
+                logger.info("Duplicate fingerprint detected, skipping url=%s", item.url)
+                return None
 
         if self.near_duplicate_enabled:
             near_duplicate = self._find_near_duplicate(item.title, content.abstract, content.full_text, item.published_at)
@@ -171,14 +212,117 @@ class MonitorPipeline:
                     near_duplicate.score,
                     near_duplicate.title,
                 )
-                return PipelineMetrics(
-                    metrics.processed + 1,
-                    metrics.alerts_sent,
-                    metrics.digest_sent,
-                    metrics.digest_queued,
-                    metrics.skipped + 1,
-                    metrics.errors,
+                return None
+
+        return _FetchedCandidate(
+            item=item,
+            content=content,
+            canonical_url=canonical_url,
+            fingerprint=fingerprint,
+            content_hash=content_hash,
+            similarity_document=similarity_document,
+            original_index=original_index,
+        )
+
+    def _dedupe_current_run_candidates(
+        self,
+        candidates: list[_FetchedCandidate],
+    ) -> tuple[list[_FetchedCandidate], int]:
+        if len(candidates) < 2:
+            return candidates, 0
+
+        parents = list(range(len(candidates)))
+
+        def find(index: int) -> int:
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        def union(left_index: int, right_index: int) -> None:
+            left_root = find(left_index)
+            right_root = find(right_index)
+            if left_root != right_root:
+                parents[right_root] = left_root
+
+        def union_exact_duplicates(attribute: str) -> None:
+            seen: dict[str, int] = {}
+            for index, candidate in enumerate(candidates):
+                key = getattr(candidate, attribute)
+                first_index = seen.get(key)
+                if first_index is None:
+                    seen[key] = index
+                else:
+                    union(first_index, index)
+
+        union_exact_duplicates("canonical_url")
+        union_exact_duplicates("content_hash")
+        union_exact_duplicates("fingerprint")
+
+        if self.near_duplicate_enabled:
+            documents = [candidate.similarity_document for candidate in candidates]
+            for match in find_near_duplicate_pairs(documents, threshold=self.near_duplicate_threshold):
+                left = candidates[match.left_index]
+                right = candidates[match.right_index]
+                if self._within_near_duplicate_window(left, right):
+                    union(match.left_index, match.right_index)
+
+        groups: dict[int, list[int]] = {}
+        for index in range(len(candidates)):
+            groups.setdefault(find(index), []).append(index)
+
+        survivor_indices: set[int] = set()
+        for group_indices in groups.values():
+            survivor_index = max(
+                group_indices,
+                key=lambda index: self._candidate_survivor_key(candidates[index]),
+            )
+            survivor_indices.add(survivor_index)
+
+        loser_indices = set(range(len(candidates))) - survivor_indices
+        for loser_index in sorted(loser_indices):
+            loser = candidates[loser_index]
+            survivor = candidates[
+                max(
+                    groups[find(loser_index)],
+                    key=lambda index: self._candidate_survivor_key(candidates[index]),
                 )
+            ]
+            logger.info(
+                "Current-run duplicate detected, skipping url=%s survivor_url=%s",
+                loser.item.url,
+                survivor.item.url,
+            )
+
+        survivors = [
+            candidate
+            for index, candidate in enumerate(candidates)
+            if index in survivor_indices
+        ]
+        return survivors, len(loser_indices)
+
+    def _candidate_survivor_key(self, candidate: _FetchedCandidate) -> tuple[datetime, int]:
+        published_at = self._ensure_utc(candidate.item.published_at)
+        return (published_at or datetime.min.replace(tzinfo=timezone.utc), -candidate.original_index)
+
+    def _within_near_duplicate_window(self, left: _FetchedCandidate, right: _FetchedCandidate) -> bool:
+        left_time = self._ensure_utc(left.item.published_at)
+        right_time = self._ensure_utc(right.item.published_at)
+        if left_time is None or right_time is None:
+            return True
+        return abs(left_time - right_time) <= timedelta(hours=self.near_duplicate_lookback_hours)
+
+    def _process_prepared(
+        self,
+        candidate: _FetchedCandidate,
+        digest_queue: list[_DigestQueueEntry],
+        metrics: PipelineMetrics,
+    ) -> PipelineMetrics:
+        item = candidate.item
+        content = candidate.content
+        canonical_url = candidate.canonical_url
+        fingerprint = candidate.fingerprint
+        content_hash = candidate.content_hash
 
         classification = self.classifier.classify(item.title, content.full_text)
         victim = self.victim_extractor.extract(item.title, content.full_text)
@@ -210,12 +354,39 @@ class MonitorPipeline:
         suppressed_out_of_scope = False
 
         with self.database.session() as session:
+            existing = session.scalar(select(Article.id).where(Article.canonical_url == canonical_url))
+            if existing:
+                return PipelineMetrics(
+                    metrics.processed,
+                    metrics.alerts_sent,
+                    metrics.digest_sent,
+                    metrics.digest_queued,
+                    metrics.skipped + 1,
+                    metrics.errors,
+                )
+
+            content_hash_exists = session.scalar(select(Article.id).where(Article.content_hash == content_hash))
+            if content_hash_exists:
+                logger.info(
+                    "Duplicate content hash detected during insert guard, skipping url=%s existing_article_id=%s",
+                    item.url,
+                    content_hash_exists,
+                )
+                return PipelineMetrics(
+                    metrics.processed,
+                    metrics.alerts_sent,
+                    metrics.digest_sent,
+                    metrics.digest_queued,
+                    metrics.skipped + 1,
+                    metrics.errors,
+                )
+
             fp_exists = session.scalar(
                 select(ArticleFingerprint.id).where(ArticleFingerprint.fingerprint == fingerprint)
             )
             if fp_exists:
                 return PipelineMetrics(
-                    metrics.processed + 1,
+                    metrics.processed,
                     metrics.alerts_sent,
                     metrics.digest_sent,
                     metrics.digest_queued,
@@ -328,7 +499,7 @@ class MonitorPipeline:
                 session.rollback()
                 logger.info("Duplicate detected during insert, skipping url=%s", item.url)
                 return PipelineMetrics(
-                    metrics.processed + 1,
+                    metrics.processed,
                     metrics.alerts_sent,
                     metrics.digest_sent,
                     metrics.digest_queued,
@@ -337,7 +508,7 @@ class MonitorPipeline:
                 )
 
         next_metrics = PipelineMetrics(
-            metrics.processed + 1,
+            metrics.processed,
             metrics.alerts_sent,
             metrics.digest_sent,
             metrics.digest_queued + (1 if digest_item else 0),

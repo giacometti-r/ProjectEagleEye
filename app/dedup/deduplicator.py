@@ -28,6 +28,13 @@ class SimilarityMatch:
     score: float
 
 
+@dataclass(frozen=True)
+class SimilarityPair:
+    left_index: int
+    right_index: int
+    score: float
+
+
 def normalize_incident_entity(value: str) -> str:
     lowered = value.lower()
     lowered = re.sub(r"[^a-z0-9 ]+", " ", lowered)
@@ -120,6 +127,25 @@ def find_near_duplicate(
     if best_score < threshold:
         return None
     return SimilarityMatch(index=best_index, score=best_score)
+
+
+def find_near_duplicate_pairs(documents: list[str], threshold: float) -> list[SimilarityPair]:
+    if len(documents) < 2 or not any(document.strip() for document in documents):
+        return []
+
+    try:
+        matrix = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), min_df=1).fit_transform(documents)
+    except ValueError:
+        return []
+
+    scores = cosine_similarity(matrix)
+    matches: list[SimilarityPair] = []
+    for left_index in range(len(documents)):
+        for right_index in range(left_index + 1, len(documents)):
+            score = float(scores[left_index, right_index])
+            if score >= threshold:
+                matches.append(SimilarityPair(left_index=left_index, right_index=right_index, score=score))
+    return matches
 
 
 def _normalize_similarity_text(text: str) -> str:

@@ -160,6 +160,7 @@ def test_pipeline_sends_once_for_canonical_duplicates() -> None:
         classifier=FakeClassifier(),
         victim_extractor=FakeVictimExtractor(),
         emailer=emailer,
+        near_duplicate_enabled=False,
     )
 
     articles = [
@@ -190,6 +191,306 @@ def test_pipeline_sends_once_for_canonical_duplicates() -> None:
         assert alert is not None
         assert alert.channel == "immediate"
         assert alert.status == "sent"
+
+
+def test_pipeline_current_run_canonical_duplicate_keeps_newest() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/article?utm_source=old": ArticleContent(
+                full_text="old article body about a phishing incident",
+                abstract="old phishing incident.",
+            ),
+            "https://example.com/article": ArticleContent(
+                full_text="new article body about a phishing incident",
+                abstract="new phishing incident.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+        near_duplicate_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle("old", "rss", "Old canonical duplicate", "https://example.com/article?utm_source=old", now),
+            SourceArticle("new", "rss", "New canonical duplicate", "https://example.com/article", now + timedelta(minutes=10)),
+        ]
+    )
+
+    assert metrics.processed == 2
+    assert metrics.alerts_sent == 1
+    assert metrics.skipped == 1
+    assert len(emailer.sent) == 1
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        alerts = session.scalars(select(Alert)).all()
+        assert len(articles) == 1
+        assert len(alerts) == 1
+        assert articles[0].url == "https://example.com/article"
+        assert articles[0].title == "New canonical duplicate"
+
+
+def test_pipeline_current_run_content_hash_duplicate_keeps_newest() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    shared_content = ArticleContent(
+        full_text="same fetched article body about Acme Corp phishing",
+        abstract="same fetched article abstract.",
+    )
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/old-content": shared_content,
+            "https://example.com/new-content": shared_content,
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+        near_duplicate_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle("old", "rss", "Old content duplicate", "https://example.com/old-content", now),
+            SourceArticle("new", "rss", "New content duplicate", "https://example.com/new-content", now + timedelta(minutes=10)),
+        ]
+    )
+
+    assert metrics.processed == 2
+    assert metrics.alerts_sent == 1
+    assert metrics.skipped == 1
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        assert len(articles) == 1
+        assert articles[0].url == "https://example.com/new-content"
+
+
+def test_pipeline_current_run_fingerprint_duplicate_keeps_newest() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    shared_prefix = "Acme Corp phishing incident " * 120
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/old-fingerprint": ArticleContent(
+                full_text=f"{shared_prefix}old trailing details",
+                abstract="old fingerprint duplicate.",
+            ),
+            "https://example.com/new-fingerprint": ArticleContent(
+                full_text=f"{shared_prefix}new trailing details",
+                abstract="new fingerprint duplicate.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+        near_duplicate_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle("old", "rss", "Same fingerprint title", "https://example.com/old-fingerprint", now),
+            SourceArticle("new", "rss", "Same fingerprint title", "https://example.com/new-fingerprint", now + timedelta(minutes=10)),
+        ]
+    )
+
+    assert metrics.processed == 2
+    assert metrics.alerts_sent == 1
+    assert metrics.skipped == 1
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        assert len(articles) == 1
+        assert articles[0].url == "https://example.com/new-fingerprint"
+
+
+def test_pipeline_current_run_near_duplicate_keeps_newest_when_enabled() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/old-near": ArticleContent(
+                full_text="WhatsApp disrupted NSO spyware phishing attacks against users.",
+                abstract="WhatsApp disrupted NSO-linked spyware phishing attacks.",
+            ),
+            "https://example.com/new-near": ArticleContent(
+                full_text="Meta said WhatsApp disrupted new spyware phishing attacks linked to NSO Group.",
+                abstract="WhatsApp disrupted NSO-linked spyware phishing activity.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle(
+                "old",
+                "rss",
+                "WhatsApp says it disrupted new NSO spyware phishing attacks - BleepingComputer",
+                "https://example.com/old-near",
+                now,
+            ),
+            SourceArticle(
+                "new",
+                "rss",
+                "WhatsApp says it disrupted new NSO spyware phishing attacks",
+                "https://example.com/new-near",
+                now + timedelta(minutes=10),
+            ),
+        ]
+    )
+
+    assert metrics.processed == 2
+    assert metrics.alerts_sent == 1
+    assert metrics.skipped == 1
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        assert len(articles) == 1
+        assert articles[0].url == "https://example.com/new-near"
+
+
+def test_pipeline_current_run_near_duplicates_both_survive_when_disabled() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/old-near": ArticleContent(
+                full_text="WhatsApp disrupted NSO spyware phishing attacks against users.",
+                abstract="WhatsApp disrupted NSO-linked spyware phishing attacks.",
+            ),
+            "https://example.com/new-near": ArticleContent(
+                full_text="Meta said WhatsApp disrupted new spyware phishing attacks linked to NSO Group.",
+                abstract="WhatsApp disrupted NSO-linked spyware phishing activity.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+        near_duplicate_enabled=False,
+        digest_recipient_email="digest@example.com",
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle(
+                "old",
+                "rss",
+                "WhatsApp says it disrupted new NSO spyware phishing attacks - BleepingComputer",
+                "https://example.com/old-near",
+                now,
+            ),
+            SourceArticle(
+                "new",
+                "rss",
+                "WhatsApp says it disrupted new NSO spyware phishing attacks",
+                "https://example.com/new-near",
+                now + timedelta(minutes=10),
+            ),
+        ]
+    )
+
+    assert metrics.processed == 2
+    assert metrics.alerts_sent == 1
+    assert metrics.digest_queued == 1
+    assert metrics.digest_sent == 1
+    assert metrics.skipped == 0
+    assert len(emailer.sent) == 2
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 2
+        assert len(session.scalars(select(Alert)).all()) == 2
+
+
+def test_pipeline_current_run_duplicate_loser_is_not_persisted_or_in_digest() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    shared_content = ArticleContent(
+        full_text="shared low confidence article body",
+        abstract="shared low confidence abstract.",
+    )
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/digest-loser": shared_content,
+            "https://example.com/digest-survivor": shared_content,
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        digest_enabled=True,
+        digest_recipient_email="digest@example.com",
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle("old", "rss", "Digest Loser", "https://example.com/digest-loser", now),
+            SourceArticle("new", "rss", "Digest Survivor", "https://example.com/digest-survivor", now + timedelta(minutes=10)),
+        ]
+    )
+
+    assert metrics.processed == 2
+    assert metrics.alerts_sent == 0
+    assert metrics.digest_queued == 1
+    assert metrics.digest_sent == 1
+    assert metrics.skipped == 1
+    assert len(emailer.sent) == 1
+    digest_body = emailer.sent[0][0].body
+    assert "Digest Survivor" in digest_body
+    assert "Digest Loser" not in digest_body
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        alerts = session.scalars(select(Alert)).all()
+        assert len(articles) == 1
+        assert len(alerts) == 1
+        assert articles[0].title == "Digest Survivor"
 
 
 def test_pipeline_routes_low_confidence_victim_to_digest() -> None:
