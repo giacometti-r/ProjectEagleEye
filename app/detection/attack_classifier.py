@@ -8,7 +8,7 @@ from typing import Literal
 ATTACK_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     "phishing": [re.compile(r"\bphishing\b", re.I)],
     "malvertising": [re.compile(r"\bmalvertising\b", re.I), re.compile(r"\bmalicious ads?\b", re.I)],
-    "impersonation": [re.compile(r"\bimpersonat(?:ion|ing)\b", re.I)],
+    "impersonation": [re.compile(r"\bimpersonat(?:ion|ing|e[sd]?|es?)\b", re.I)],
     "business email compromise": [re.compile(r"\b(BEC|business email compromise)\b", re.I)],
     "smishing": [re.compile(r"\bsmishing\b", re.I)],
     "vishing": [re.compile(r"\bvishing\b", re.I)],
@@ -16,7 +16,11 @@ ATTACK_PATTERNS: dict[str, list[re.Pattern[str]]] = {
     "seo poisoning": [re.compile(r"\bSEO poisoning\b", re.I)],
     "watering hole": [re.compile(r"\bwatering hole\b", re.I)],
     "social media scams": [re.compile(r"\bsocial media scam\w*\b", re.I)],
-    "credential theft": [re.compile(r"\bcredential(?:s)? theft\b", re.I), re.compile(r"\bstolen credentials?\b", re.I)],
+    "credential theft": [
+        re.compile(r"\bcredential(?:s)? theft\b", re.I),
+        re.compile(r"\bcredential steal(?:er|ing)\b", re.I),
+        re.compile(r"\bstol(?:e|en) credentials?\b", re.I),
+    ],
 }
 
 ARTICLE_TYPE = Literal[
@@ -62,15 +66,82 @@ OPINION_PATTERNS = [
     re.compile(r"\b(without security is like|what you see is not all there is)\b", re.I),
 ]
 
+OUT_OF_SCOPE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    (
+        "out-of-scope:local-fraud-blotter",
+        re.compile(
+            r"\b(seek(?:s|ing)? help identifying suspect|public assistance identifying|"
+            r"fraud impersonation case|police impersonation incident)\b",
+            re.I,
+        ),
+    ),
+    (
+        "out-of-scope:community-awareness",
+        re.compile(
+            r"\b(cyber(?:security)? awareness drive|discuss(?:es|ed|ing) waste management, cybersecurity|"
+            r"meeting agenda|public awareness session)\b",
+            re.I,
+        ),
+    ),
+    (
+        "out-of-scope:vendor-partnership",
+        re.compile(
+            r"\b(partners? with .{1,80}\b(?:strengthen|expand) identity security|"
+            r"adds .{1,80}\bexpand identity security portfolio)\b",
+            re.I,
+        ),
+    ),
+    (
+        "out-of-scope:admin-authentication",
+        re.compile(
+            r"\b(face authentication|identity verification).{0,120}\b"
+            r"(civil services prelims|exam|blocks? impersonation)\b",
+            re.I,
+        ),
+    ),
+    (
+        "out-of-scope:generic-explainer",
+        re.compile(
+            r"\b(how to recover from a phishing scam|what is malware\?|how it spreads and how to stay safe)\b",
+            re.I,
+        ),
+    ),
+    (
+        "out-of-scope:school-photo-warning",
+        re.compile(r"\badvises schools against sharing students'? photos online\b", re.I),
+    ),
+    (
+        "out-of-scope:site-index",
+        re.compile(r"\bkrebs on security\s*[-\u2013\u2014]\s*in-depth security news", re.I),
+    ),
+]
+
 CYBER_SCOPE_PATTERNS = [
     re.compile(
         (
-            r"\b(cyber(?:security|crime|attack|attacks)?|phishing|spearfishing|spear phishing|"
+            r"\b(cyber(?:crime|attack|attacks|criminals?|threats?)|phishing|spearfishing|spear phishing|"
             r"malware|ransomware|spyware|malvertising|smishing|vishing|credential(?:s)?|"
-            r"business email compromise|BEC|spoofing|impersonation|social engineering|"
+            r"password-steal(?:ing|er)|infostealer|business email compromise|BEC|spoofing|social engineering|"
             r"vulnerabilit(?:y|ies)|exploit(?:ed|s)?|zero-day|0-day|cve-\d{4}-\d+|"
             r"breach(?:ed)?|hacker(?:s)?|botnet|backdoor|wiper|remote code execution|RCE|"
-            r"patch tuesday|security update(?:s)?)\b"
+            r"patch tuesday|security update(?:s)?|supply chain attack(?:s)?|malicious packages?|"
+            r"npm|pypi|cryptomining|fileless|DNS fast flux|RMM tools?|data exfiltrat(?:ion|ed))\b"
+        ),
+        re.I,
+    ),
+    re.compile(
+        (
+            r"\b(brand|employee|executive|helpdesk|tech support|customer trust|microsoft 365|"
+            r"account|email|login|cloud|deepfake|voice[- ]cloning|social engineering)\b"
+            r".{0,120}\bimpersonat(?:ion|ing|e|es|ed)\b"
+        ),
+        re.I,
+    ),
+    re.compile(
+        (
+            r"\bimpersonat(?:ion|ing|e|es|ed)\b.{0,120}\b"
+            r"(brand|employee|executive|helpdesk|tech support|customer trust|microsoft 365|"
+            r"account|email|login|cloud|deepfake|voice[- ]cloning|social engineering|credential(?:s)?)\b"
         ),
         re.I,
     ),
@@ -108,9 +179,13 @@ class AttackClassifier:
         legal_score = self._score_patterns(LEGAL_FOLLOWUP_PATTERNS, title, lead, body)
         opinion_score = self._score_patterns(OPINION_PATTERNS, title, lead, body)
         in_cyber_scope = self._has_cyber_scope(title, lead, body)
+        out_of_scope_reason = self._explicit_out_of_scope_reason(title, lead, body)
 
         reasons: list[str] = []
-        if not in_cyber_scope:
+        if out_of_scope_reason:
+            reasons.append(out_of_scope_reason)
+            article_type: ARTICLE_TYPE = "out_of_scope"
+        elif not in_cyber_scope:
             reasons.append("out-of-scope")
             article_type: ARTICLE_TYPE = "out_of_scope"
         elif press_score >= 0.8:
@@ -202,3 +277,10 @@ class AttackClassifier:
     def _has_cyber_scope(self, title: str, lead: str, body: str) -> bool:
         corpus = f"{title} {lead} {body[:4000]}"
         return any(pattern.search(corpus) for pattern in CYBER_SCOPE_PATTERNS)
+
+    def _explicit_out_of_scope_reason(self, title: str, lead: str, body: str) -> str | None:
+        corpus = f"{title} {lead} {body[:2000]}"
+        for reason, pattern in OUT_OF_SCOPE_PATTERNS:
+            if pattern.search(corpus):
+                return reason
+        return None

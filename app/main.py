@@ -34,7 +34,9 @@ def gather_articles(settings: object) -> list[SourceArticle]:
 
     if cfg.enable_gdelt:
         combined_query = (
-            "(phishing OR malvertising OR impersonation OR \"business email compromise\" OR "
+            "(phishing OR malvertising OR \"brand impersonation\" OR \"employee impersonation\" OR "
+            "\"executive impersonation\" OR \"tech support scam\" OR \"social engineering\" OR "
+            "deepfake OR \"voice cloning\" OR \"business email compromise\" OR "
             "smishing OR vishing OR \"fake update\" OR \"SEO poisoning\" OR \"watering hole\" "
             "OR \"social media scam\" OR \"credential theft\") "
             "AND (company OR government OR university OR hospital OR healthcare)"

@@ -9,6 +9,7 @@ Python 3.11 service that monitors free cybersecurity news sources (RSS, Google N
 - Article-type gating: `incident`, `campaign_report`, `advisory`, `press_release`, `legal_followup`, `opinion`, `out_of_scope`.
 - Strict immediate alerting: immediate emails only for qualified incidents with in-taxonomy attack type and confident victim extraction.
 - Digest channel: one digest email per run for queued non-immediate items; clearly out-of-scope items are suppressed by default.
+- Source queries and cyber-scope filters reject broad `impersonation`/`cybersecurity` matches unless they include digital threat context.
 - Cross-source incident dedupe: 48-hour incident-key dedupe to suppress syndicated rewrites in immediate channel.
 - TF-IDF cosine near-duplicate detection to skip syndicated/reworded articles before alerting.
 - Boilerplate-resistant article cleanup and improved abstract generation with metadata fallback.
@@ -158,6 +159,8 @@ If canonical URL, content hash, near-duplicate similarity, or fingerprint alread
 
 - Article-type gating blocks press releases, legal recaps, advisories, and opinion pieces from immediate channel.
 - Cyber-scope gating suppresses non-cyber stories that only contain generic words such as `attack`.
+- Bare `impersonation` is not enough for cyber scope; it must be tied to phishing, credentials, accounts, tech support scams, brand/employee/executive impersonation, deepfakes, voice cloning, BEC, or social engineering.
+- Explicit out-of-scope rules suppress local/offline fraud blotter, community awareness/meeting items, vendor partnership announcements, administrative identity checks, generic explainers, and bare site-index results.
 - Confidence thresholds enforce both incident context and victim quality.
 - Incident-key and TF-IDF dedupe suppress syndicated wire rewrites and source-title variants.
 - Victim extraction rejects generic users, product fragments, sentence spillover, and reporting-time fragments.
@@ -210,3 +213,4 @@ PYTHONPATH=. pytest -q
 - Abstract quality still depends on source HTML structure and metadata quality.
 - Schema initialization is idempotent but is not a full migration system.
 - Closed taxonomy intentionally routes some real incidents to digest as `out_of_taxonomy`.
+- Scope filtering is heuristic; new noisy source patterns may require adding explicit out-of-scope rules.

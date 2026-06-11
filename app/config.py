@@ -17,7 +17,7 @@ DEFAULT_RSS_FEEDS = [
 DEFAULT_GOOGLE_NEWS_QUERIES = [
     '(phishing OR "spear phishing" OR "business email compromise") (company OR government OR university OR hospital OR organization)',
     '(malvertising OR "credential theft" OR smishing OR vishing) (victim OR company OR organization)',
-    '("SEO poisoning" OR "watering hole" OR "social media scam" OR impersonation OR "fake update") (cyber OR malware OR credentials OR organization)',
+    '("SEO poisoning" OR "watering hole" OR "social media scam" OR "fake update" OR "brand impersonation" OR "employee impersonation" OR "executive impersonation" OR "tech support scam" OR "social engineering" OR deepfake OR "voice cloning") (cyber OR malware OR credentials OR phishing OR scam OR organization)',
 ]
 
 

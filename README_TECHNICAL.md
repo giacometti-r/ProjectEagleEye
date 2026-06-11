@@ -166,6 +166,7 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 #### `DEFAULT_GOOGLE_NEWS_QUERIES` (`list[str]`)
 
 - Purpose: fallback Google News queries when `GOOGLE_NEWS_QUERIES` unset.
+- Scope: avoids bare `impersonation`; uses specific brand/employee/executive impersonation, tech support scam, social engineering, deepfake, and voice-cloning terms paired with cyber/scam/credential context.
 - Consumer: `load_settings()`.
 
 #### `Settings` (`@dataclass(frozen=True)`)
@@ -349,6 +350,7 @@ Source failures are isolated (`try/except` per source, warning logged). All coll
 - Output: list of `SourceArticle` sorted newest-first.
 - Side effects:
   - Network calls through source adapters.
+  - Optional GDELT query mirrors the scoped social-engineering terms used by Google News defaults and avoids bare `impersonation`.
   - Warning logs on per-source failure.
 - Failure behavior:
   - Individual source exceptions are swallowed with warning.
@@ -593,9 +595,13 @@ Methods:
   - Sentence splitter regex.
 - `INCIDENT_PATTERNS`, `CAMPAIGN_PATTERNS`, `ADVISORY_PATTERNS`, `PRESS_RELEASE_PATTERNS`, `LEGAL_FOLLOWUP_PATTERNS`, `OPINION_PATTERNS`
   - Weighted cue families used for article type scoring.
+- `OUT_OF_SCOPE_PATTERNS`
+  - Explicit false-positive suppressions applied before normal article-type routing.
+  - Covers local/offline fraud blotter, community awareness or meeting-agenda items, vendor partnership/product portfolio announcements, administrative identity/authentication stories, generic explainers, school photo warnings, and bare site-index results.
 - `CYBER_SCOPE_PATTERNS`
   - Strong cyber/security terms required before article-type routing proceeds.
   - Prevents generic physical/political `attack` stories from entering digest.
+  - Does not treat bare `impersonation` or broad `cybersecurity` as sufficient; impersonation must appear with digital threat context such as phishing, credentials, accounts, tech support scams, brand/employee/executive impersonation, deepfakes, voice cloning, BEC, or social engineering.
 
 #### `ClassificationResult` (`@dataclass(frozen=True)`)
 
@@ -611,9 +617,10 @@ Methods:
   - Builds lead/body views.
   - Detects best attack type and confidence.
   - Scores article-type cue groups.
+  - Applies explicit out-of-scope suppressions before article-type routing.
   - Applies a cyber-scope gate before assigning in-scope article types.
   - Applies ordered decision rules to assign one article type.
-  - Adds explanatory reason tokens, including `out-of-scope` or out-of-taxonomy markers.
+  - Adds explanatory reason tokens, including named `out-of-scope:*` or out-of-taxonomy markers.
 
 - `_build_lead(text) -> str`
   - First four sentences, clipped to 1500 chars.
@@ -627,6 +634,9 @@ Methods:
 
 - `_has_cyber_scope(title, lead, body) -> bool`
   - Returns true when strong cyber/security terms are present in title, lead, or early body.
+
+- `_explicit_out_of_scope_reason(title, lead, body) -> str | None`
+  - Returns a named `out-of-scope:*` reason for known false-positive families before routing proceeds.
 
 ## 6.7 `app/detection/victim_extractor.py`
 
@@ -858,6 +868,10 @@ This section maps each test symbol to the production behavior it validates.
   - Confirms physical/war attack headlines are not treated as cyber news.
 - `test_classifies_vulnerability_advisory_as_in_scope()`
   - Confirms vulnerability/zero-day advisories remain in-scope even without an attack taxonomy label.
+- `test_digest_false_positives_are_out_of_scope()`
+  - Confirms known digest false positives are suppressed: local impersonation/fraud blotter, school photo warnings, vendor identity-security announcements, meeting/awareness items, exam face-authentication stories, site-index entries, and generic explainers.
+- `test_digest_cyber_items_remain_in_scope()`
+  - Confirms cyber-relevant digest items still pass: tech support impersonation scams, brand/employee impersonation reports, phishing, NSO/Pegasus stories, malware, malicious package/credential stealer reports, and vishing/extortion campaigns.
 
 ## 7.4 `tests/test_victim_extractor.py`
 
@@ -1013,6 +1027,7 @@ Build behavior:
 
 - Add new source adapters implementing `NewsSource.fetch` shape.
 - Expand taxonomy by adding `ATTACK_PATTERNS` entries and adjusting classifier thresholds/rules.
+- Tune false-positive suppression by adding `OUT_OF_SCOPE_PATTERNS` entries or refining `CYBER_SCOPE_PATTERNS`.
 - Improve extraction robustness by tuning `VICTIM_PATTERNS`, noise filters, and confidence heuristics.
 - Tune duplicate sensitivity through `NEAR_DUPLICATE_THRESHOLD`, lookback, and comparison-count settings.
 - Introduce migration tooling (for example Alembic) to replace ad-hoc schema evolution in `initialize_schema`.
