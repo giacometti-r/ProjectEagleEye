@@ -378,7 +378,12 @@ class MonitorPipeline:
         routing_reason = self._routing_reason(classification.article_type, classification.attack_type, has_confident_victim, duplicate_incident)
 
         if self.digest_topic_dedupe_enabled and not immediate_ready:
-            topic_duplicate = self._find_digest_topic_duplicate(item.title, content.abstract, item.published_at)
+            topic_duplicate = self._find_digest_topic_duplicate(
+                item.title,
+                content.abstract,
+                content.full_text,
+                item.published_at,
+            )
             if topic_duplicate is not None:
                 logger.info(
                     "Digest topic duplicate detected, skipping url=%s matched_article_id=%s score=%.3f matched_title=%s shared_title_terms=%s",
@@ -646,6 +651,7 @@ class MonitorPipeline:
         self,
         title: str,
         abstract: str,
+        text: str,
         candidate_time: datetime | None,
     ) -> _TopicDuplicateResult | None:
         if self.near_duplicate_max_comparisons <= 0:
@@ -657,6 +663,7 @@ class MonitorPipeline:
                     Article.id,
                     Article.title,
                     Article.abstract,
+                    Article.article_text,
                     Article.published_at,
                     Article.created_at,
                 )
@@ -673,21 +680,22 @@ class MonitorPipeline:
             if self.digest_topic_dedupe_lookback_hours and self.digest_topic_dedupe_lookback_hours > 0
             else None
         )
-        existing_items: list[tuple[str, str]] = []
+        existing_items: list[tuple[str, str, str]] = []
         existing_metadata: list[tuple[int, str]] = []
 
-        for article_id, existing_title, existing_abstract, published_at, created_at in rows:
+        for article_id, existing_title, existing_abstract, existing_text, published_at, created_at in rows:
             if candidate_reference is not None and window is not None:
                 reference = self._ensure_utc(published_at or created_at)
                 if reference is not None and abs(candidate_reference - reference) > window:
                     continue
 
-            existing_items.append((existing_title, existing_abstract))
+            existing_items.append((existing_title, existing_abstract, existing_text))
             existing_metadata.append((article_id, existing_title))
 
         match = find_topic_duplicate(
             title,
             abstract,
+            text,
             existing_items,
             threshold=self.digest_topic_dedupe_threshold,
         )

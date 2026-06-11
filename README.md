@@ -136,7 +136,7 @@ Each candidate article is freshness-filtered and deduplicated by:
 4. **TF-IDF cosine similarity**: compares normalized title + abstract + article-text prefix against recent stored articles to skip near-duplicates.
 5. **Fingerprint hash**: SHA-256 over normalized title + article text prefix.
 6. **Incident key**: SHA-256 over normalized `(victim + attack type)` with a time window (`INCIDENT_DEDUPE_WINDOW_HOURS`) to skip same-victim incident follow-ups.
-7. **Digest-topic similarity**: compares title + abstract for non-immediate items and requires shared salient headline terms before skipping.
+7. **Digest-topic similarity**: compares title + abstract + article-text prefix for non-immediate items and requires shared salient headline terms before skipping.
 
 If canonical URL, content hash, near-duplicate similarity, fingerprint, incident key, or digest-topic similarity already matches, the article is skipped.
 

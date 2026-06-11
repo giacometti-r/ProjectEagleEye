@@ -661,6 +661,73 @@ def test_pipeline_skips_digest_topic_duplicate() -> None:
         assert articles[0].url == "https://example.com/meta-one"
 
 
+def test_pipeline_skips_digest_topic_duplicate_using_article_text() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/ai-one": ArticleContent(
+                full_text=(
+                    "Microsoft Threat Intelligence observed phishing, malvertising, and SEO poisoning "
+                    "campaigns using AI brands as bait. Attackers impersonated OpenAI, Anthropic, and "
+                    "DeepSeek to lure victims into credential theft pages and malicious downloads."
+                ),
+                abstract="Researchers reported an uptick in attacks.",
+            ),
+            "https://example.com/ai-two": ArticleContent(
+                full_text=(
+                    "Threat actors are using trusted AI brands as bait in phishing, malvertising, and "
+                    "search engine optimization abuse. Campaigns impersonate OpenAI, Anthropic, and "
+                    "DeepSeek to lure victims into credential theft pages and malicious downloads."
+                ),
+                abstract="Security researchers warned about evolving social engineering activity.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        digest_enabled=True,
+        digest_recipient_email="digest@example.com",
+        near_duplicate_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle(
+                "first",
+                "rss",
+                "Hackers are capitalizing on AI hype to ramp up social engineering attacks - IT Pro",
+                "https://example.com/ai-one",
+                now + timedelta(minutes=10),
+            ),
+            SourceArticle(
+                "second",
+                "rss",
+                "AI brands as bait: How threat actors are using the AI hype in social engineering - Microsoft",
+                "https://example.com/ai-two",
+                now,
+            ),
+        ]
+    )
+
+    assert metrics.processed == 2
+    assert metrics.alerts_sent == 0
+    assert metrics.digest_queued == 1
+    assert metrics.digest_sent == 1
+    assert metrics.skipped == 1
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 1
+        assert len(session.scalars(select(Alert)).all()) == 1
+
+
 def test_pipeline_keeps_digest_items_with_only_generic_title_overlap() -> None:
     database = Database(_settings("sqlite+pysqlite:///:memory:"))
     initialize_schema(database)

@@ -117,21 +117,94 @@ def test_topic_duplicate_matches_digest_rewrite_examples() -> None:
         match = find_topic_duplicate(
             candidate_title,
             candidate_abstract,
-            [(existing_title, existing_abstract)],
+            "",
+            [(existing_title, existing_abstract, "")],
             threshold=0.30,
         )
         assert match is not None, candidate_title
         assert match.index == 0
 
 
+def test_topic_duplicate_uses_article_text_when_abstracts_are_weak() -> None:
+    match = find_topic_duplicate(
+        "AI brands as bait: How threat actors are using the AI hype in social engineering - Microsoft",
+        "Security researchers warned about evolving social engineering activity.",
+        (
+            "Threat actors are using trusted AI brands as bait in phishing, malvertising, and search "
+            "engine optimization abuse. Campaigns impersonate OpenAI, Anthropic, and DeepSeek to lure "
+            "victims into credential theft pages and malicious downloads."
+        ),
+        [
+            (
+                "Hackers are capitalizing on AI hype to ramp up social engineering attacks - IT Pro",
+                "Researchers reported an uptick in attacks.",
+                (
+                    "Microsoft Threat Intelligence observed phishing, malvertising, and SEO poisoning "
+                    "campaigns using AI brands as bait. Attackers impersonated OpenAI, Anthropic, and "
+                    "DeepSeek to lure victims into credential theft pages and malicious downloads."
+                ),
+            )
+        ],
+        threshold=0.30,
+    )
+
+    assert match is not None
+    assert match.index == 0
+
+
+def test_topic_duplicate_handles_weak_abstract_with_shared_body_signal() -> None:
+    match = find_topic_duplicate(
+        "WhatsApp Targeted Again by NSO-linked Phishing Campaign, Meta Says - Haaretz",
+        "In the News In the News: Israel-Iran Live Updates Lebanon U.S.-Iran Erdogan.",
+        (
+            "Meta said WhatsApp users were targeted by NSO-linked spyware operators in a spear phishing "
+            "campaign. The one-click phishing attempts were aimed at users in Jordan and Lebanon."
+        ),
+        [
+            (
+                "Meta Says Israeli Spyware Firm Targeted WhatsApp Users in Spear-Phishing Campaign - SFist",
+                "The article discussed the latest spyware allegations.",
+                (
+                    "Meta said Israeli spyware firm NSO targeted WhatsApp users in a spear phishing "
+                    "campaign. The one-click phishing attempts focused on users in Jordan and Lebanon."
+                ),
+            )
+        ],
+        threshold=0.30,
+    )
+
+    assert match is not None
+    assert match.index == 0
+
+
 def test_topic_duplicate_requires_salient_title_overlap() -> None:
     match = find_topic_duplicate(
         "Microsoft Teams to add brand impersonation warnings to calls",
         "Microsoft Teams will add warnings for suspicious calls.",
+        "Microsoft Teams will warn users about suspicious external calls and impersonation attempts.",
         [
             (
                 "Microsoft patches Exchange Server zero-day exploited in attacks",
                 "Microsoft released Exchange Server security updates for an exploited vulnerability.",
+                "Microsoft released Exchange Server patches for a zero-day vulnerability exploited in attacks.",
+            )
+        ],
+        threshold=0.30,
+    )
+
+    assert match is None
+
+
+def test_topic_duplicate_keeps_separate_vendor_product_launches() -> None:
+    match = find_topic_duplicate(
+        "KnowBe4 launches game to train staff on vishing scams - SecurityBrief Australia",
+        "KnowBe4 launched a gamified vishing training tool for employees.",
+        "The training game helps staff identify voice phishing calls and social engineering attempts.",
+        [
+            (
+                "KnowBe4 launches Teams security to tackle chat phishing - SecurityBrief Asia",
+                "KnowBe4 launched Microsoft Teams security to detect chat phishing.",
+                "The Teams security product detects suspicious messages and phishing attempts in collaboration channels.",
             )
         ],
         threshold=0.30,

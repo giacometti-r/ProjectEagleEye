@@ -129,7 +129,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
    - Cross-incident dedupe window check (`_has_recent_incident_duplicate`).
    - Duplicate incidents are skipped before persistence.
    - Immediate eligibility decision using article type + taxonomy + victim confidence + duplicate status.
-   - Digest-bound topic duplicate check using title + abstract similarity and shared salient title terms.
+   - Digest-bound topic duplicate check using title + abstract + article-text prefix similarity and shared salient title terms.
    - Transactional persistence of `Article`, `ArticleFingerprint`, and `Alert` row.
    - Immediate SMTP send or digest queueing, followed by one run-level digest flush.
 
@@ -153,7 +153,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 6. Current-run exact dedupe by canonical URL, content hash, and fingerprint.
 7. Current-run near-duplicate dedupe using the same similarity threshold/window settings.
 8. Incident-window dedupe (`articles.incident_key` + temporal comparison).
-9. Digest-topic dedupe (`TfidfVectorizer` over title + abstract plus salient title-overlap guard).
+9. Digest-topic dedupe (`TfidfVectorizer` over title + abstract + article-text prefix plus salient title-overlap guard).
 
 ### 3.6 Scheduling and Operations
 
@@ -249,7 +249,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 | `digest_recipient_email` | `DIGEST_RECIPIENT_EMAIL` | `str` | conditional | fallback to `RECIPIENT_EMAIL` | strip + fallback | Recipient for digest alerts. |
 | `digest_max_items_per_run` | `DIGEST_MAX_ITEMS_PER_RUN` | `int` | no | `100` | `int(...)` | Cap on queued digest items. |
 | `digest_topic_dedupe_enabled` | `DIGEST_TOPIC_DEDUPE_ENABLED` | `bool` | no | `true` | truthy set | Enables topic-level duplicate skips for digest-bound items. |
-| `digest_topic_dedupe_threshold` | `DIGEST_TOPIC_DEDUPE_THRESHOLD` | `float` | no | `0.30` | `float(...)` | Minimum title+abstract cosine score for digest-topic duplicate candidates. |
+| `digest_topic_dedupe_threshold` | `DIGEST_TOPIC_DEDUPE_THRESHOLD` | `float` | no | `0.30` | `float(...)` | Minimum title+abstract+text cosine score for digest-topic duplicate candidates. |
 | `digest_topic_dedupe_lookback_hours` | `DIGEST_TOPIC_DEDUPE_LOOKBACK_HOURS` | `int` | no | fallback to `MAX_ARTICLE_AGE_HOURS` | `int(...)` | Time window for stored digest-topic comparisons. |
 | `abstract_max_chars` | `ABSTRACT_MAX_CHARS` | `int` | no | `420` | `int(...)` | Max abstract length for article summaries. |
 | `max_victim_words` | `MAX_VICTIM_WORDS` | `int` | no | `8` | `int(...)` | Victim extractor candidate/finalization word limit. |
@@ -486,10 +486,10 @@ Methods:
   - Finds prior articles with same incident key and compares UTC time delta to configured window.
   - If candidate time is missing but matches exist, returns `True` conservatively.
 
-- `_find_digest_topic_duplicate(title, abstract, candidate_time) -> _TopicDuplicateResult | None`
+- `_find_digest_topic_duplicate(title, abstract, text, candidate_time) -> _TopicDuplicateResult | None`
   - Loads recent stored articles up to `near_duplicate_max_comparisons`.
   - Applies `digest_topic_dedupe_lookback_hours` when candidate time is known.
-  - Uses `find_topic_duplicate()` over title + abstract and requires shared salient title terms.
+  - Uses `find_topic_duplicate()` over title + abstract + article-text prefix and requires shared salient title terms.
 
 - `_find_near_duplicate(title, abstract, text, candidate_time) -> _NearDuplicateResult | None`
   - Loads recent stored articles up to `near_duplicate_max_comparisons`.
@@ -614,10 +614,10 @@ Methods:
   - Removes common trailing source suffixes from titles.
   - Includes normalized title, abstract, and configurable article-text prefix.
 
-#### `build_topic_document(title: str, abstract: str) -> str`
+#### `build_topic_document(title: str, abstract: str, text: str = "", text_prefix_chars=4000) -> str`
 
 - Purpose: build the title-weighted normalized text used for digest-topic duplicate matching.
-- Behavior: source suffix removal, topic-token normalization, and title repetition to weight headlines.
+- Behavior: source suffix removal, topic-token normalization, title repetition to weight headlines, and normalized article-text prefix inclusion.
 
 #### `salient_title_tokens(title: str) -> set[str]`
 
@@ -635,9 +635,9 @@ Methods:
   - Returns the best match only when score is at least `threshold`.
   - Returns `None` for empty corpora or empty vectorizer vocabularies.
 
-#### `find_topic_duplicate(candidate_title, candidate_abstract, existing_items, threshold) -> TopicDuplicateMatch | None`
+#### `find_topic_duplicate(candidate_title, candidate_abstract, candidate_text, existing_items, threshold) -> TopicDuplicateMatch | None`
 
-- Purpose: detect digest-topic duplicates with lower title+abstract similarity plus salient-title overlap.
+- Purpose: detect digest-topic duplicates with title+abstract+text similarity plus salient-title overlap.
 - Behavior:
   - Uses English stop words and unigram/bigram features over `build_topic_document()`.
   - Checks candidate matches from highest to lowest score.

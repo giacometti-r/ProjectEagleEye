@@ -168,15 +168,17 @@ def build_similarity_document(title: str, abstract: str, text: str, text_prefix_
     )
 
 
-def build_topic_document(title: str, abstract: str) -> str:
+def build_topic_document(title: str, abstract: str, text: str = "", text_prefix_chars: int = 4000) -> str:
     normalized_title = _normalize_topic_text(SOURCE_SUFFIX_RE.sub("", title))
     normalized_abstract = _normalize_topic_text(abstract)
+    normalized_text = _normalize_topic_text(text[:text_prefix_chars])
     return " ".join(
         part
         for part in (
             normalized_title,
             normalized_title,
             normalized_abstract,
+            normalized_text,
         )
         if part
     )
@@ -233,14 +235,18 @@ def find_near_duplicate(
 def find_topic_duplicate(
     candidate_title: str,
     candidate_abstract: str,
-    existing_items: list[tuple[str, str]],
+    candidate_text: str,
+    existing_items: list[tuple[str, str, str]],
     threshold: float,
 ) -> TopicDuplicateMatch | None:
     if not candidate_title.strip() or not existing_items:
         return None
 
-    candidate_document = build_topic_document(candidate_title, candidate_abstract)
-    existing_documents = [build_topic_document(title, abstract) for title, abstract in existing_items]
+    candidate_document = build_topic_document(candidate_title, candidate_abstract, candidate_text)
+    existing_documents = [
+        build_topic_document(title, abstract, text)
+        for title, abstract, text in existing_items
+    ]
     if not candidate_document.strip() or not any(document.strip() for document in existing_documents):
         return None
 
