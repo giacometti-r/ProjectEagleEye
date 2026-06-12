@@ -50,8 +50,8 @@ def test_gather_articles_filters_stale_source_items(monkeypatch) -> None:
     ]
 
     class FakeRssSource:
-        def __init__(self, feed_url: str, max_articles: int) -> None:
-            del feed_url, max_articles
+        def __init__(self, feed_url: str, max_articles: int, timeout_seconds: int = 15) -> None:
+            del feed_url, max_articles, timeout_seconds
 
         def fetch(self) -> list[SourceArticle]:
             return articles
@@ -71,8 +71,8 @@ def test_gather_articles_keeps_stale_items_when_age_filter_disabled(monkeypatch)
     ]
 
     class FakeRssSource:
-        def __init__(self, feed_url: str, max_articles: int) -> None:
-            del feed_url, max_articles
+        def __init__(self, feed_url: str, max_articles: int, timeout_seconds: int = 15) -> None:
+            del feed_url, max_articles, timeout_seconds
 
         def fetch(self) -> list[SourceArticle]:
             return articles

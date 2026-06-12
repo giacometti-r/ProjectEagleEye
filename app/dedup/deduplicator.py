@@ -158,8 +158,6 @@ def build_similarity_document(title: str, abstract: str, text: str, text_prefix_
     return " ".join(
         part
         for part in (
-            #normalized_title,
-            #normalized_title,
             normalized_title,
             normalized_abstract,
             normalized_text,
@@ -232,6 +230,55 @@ def find_near_duplicate(
     return SimilarityMatch(index=best_index, score=best_score)
 
 
+def find_near_duplicate_candidates(
+    candidate_documents: list[str],
+    existing_documents: list[str],
+    threshold: float,
+    allowed_existing_indices: dict[int, set[int]] | None = None,
+) -> dict[int, SimilarityMatch]:
+    if not candidate_documents or not existing_documents:
+        return {}
+
+    usable_candidate_indexes = [
+        index
+        for index, document in enumerate(candidate_documents)
+        if document.strip()
+    ]
+    if not usable_candidate_indexes or not any(document.strip() for document in existing_documents):
+        return {}
+
+    documents = [
+        *(candidate_documents[index] for index in usable_candidate_indexes),
+        *existing_documents,
+    ]
+    try:
+        matrix = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), min_df=1).fit_transform(documents)
+    except ValueError:
+        return {}
+
+    candidate_count = len(usable_candidate_indexes)
+    scores = cosine_similarity(matrix[:candidate_count], matrix[candidate_count:])
+    matches: dict[int, SimilarityMatch] = {}
+    for row_index, candidate_index in enumerate(usable_candidate_indexes):
+        allowed = allowed_existing_indices.get(candidate_index) if allowed_existing_indices else None
+        if allowed is not None:
+            candidate_existing_indexes = [
+                index
+                for index in allowed
+                if 0 <= index < len(existing_documents)
+            ]
+        else:
+            candidate_existing_indexes = list(range(len(existing_documents)))
+        if not candidate_existing_indexes:
+            continue
+
+        best_index = max(candidate_existing_indexes, key=lambda index: float(scores[row_index, index]))
+        best_score = float(scores[row_index, best_index])
+        if best_score >= threshold:
+            matches[candidate_index] = SimilarityMatch(index=best_index, score=best_score)
+    return matches
+
+
 def find_topic_duplicate(
     candidate_title: str,
     candidate_abstract: str,
@@ -247,6 +294,24 @@ def find_topic_duplicate(
         build_topic_document(title, abstract, text)
         for title, abstract, text in existing_items
     ]
+    return find_topic_duplicate_from_documents(
+        candidate_title,
+        candidate_document,
+        [title for title, _, _ in existing_items],
+        existing_documents,
+        threshold,
+    )
+
+
+def find_topic_duplicate_from_documents(
+    candidate_title: str,
+    candidate_document: str,
+    existing_titles: list[str],
+    existing_documents: list[str],
+    threshold: float,
+) -> TopicDuplicateMatch | None:
+    if not candidate_title.strip() or not existing_titles:
+        return None
     if not candidate_document.strip() or not any(document.strip() for document in existing_documents):
         return None
 
@@ -262,7 +327,7 @@ def find_topic_duplicate(
         score = float(scores[index])
         if score < threshold:
             break
-        shared_terms = shared_salient_title_terms(candidate_title, existing_items[index][0])
+        shared_terms = shared_salient_title_terms(candidate_title, existing_titles[index])
         if shared_terms:
             return TopicDuplicateMatch(index=index, score=score, shared_title_terms=shared_terms)
     return None

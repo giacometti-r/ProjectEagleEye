@@ -10,6 +10,7 @@ Python 3.11 service that monitors free cybersecurity news sources (RSS, Google N
 - Strict immediate alerting: immediate emails only for qualified incidents with in-taxonomy attack type and confident victim extraction.
 - Digest channel: one digest email per run for queued non-immediate items; clearly out-of-scope items are suppressed by default.
 - Source freshness filtering drops stale dated items before article fetch/classification.
+- Source and article HTTP fetches use explicit timeouts and isolated sessions (`trust_env=False`).
 - Source queries and cyber-scope filters reject broad `impersonation`/`cybersecurity` matches unless they include digital threat context.
 - Cross-source incident dedupe: 48-hour incident-key dedupe to suppress syndicated rewrites in immediate channel.
 - TF-IDF cosine near-duplicate and digest-topic duplicate detection to skip syndicated/reworded articles before alerting.
@@ -102,8 +103,8 @@ kubectl apply --dry-run=client -k k8s/overlays/prod
 
 ## CI/CD
 
-- Pull requests install dependencies, run `pytest`, and build the container image locally.
-- Pushes to `main` run tests, build and push the image to GHCR, update `k8s/overlays/prod/kustomization.yaml` with the commit SHA tag, and commit that GitOps change.
+- Pull requests install development dependencies, run `pytest`, and build the container image locally.
+- Pushes to `main` run tests with development dependencies, build and push the runtime-only image to GHCR, update `k8s/overlays/prod/kustomization.yaml` with the commit SHA tag, and commit that GitOps change.
 - Argo CD watches `k8s/overlays/prod` on `main` and syncs the cluster with prune/self-heal enabled.
 
 ## Security Controls
@@ -127,7 +128,7 @@ This executes at minute 0 every hour.
 
 ## Deduplication Logic
 
-Each candidate article is freshness-filtered and deduplicated by:
+Each candidate article is freshness-filtered and deduplicated by batched stored-key checks, current-run grouping, and cached recent-article similarity comparisons:
 
 1. **Source freshness**: drops dated source items older than `MAX_ARTICLE_AGE_HOURS`; missing dates are retained.
 2. **Canonical URL**: strips tracking parameters (`utm_*`, `gclid`, `fbclid`) and normalizes URL parts.
@@ -208,7 +209,7 @@ Run tests locally:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 PYTHONPATH=. pytest -q
 ```
 

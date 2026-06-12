@@ -14,10 +14,11 @@ from app.dedup.deduplicator import (
     build_fingerprint,
     build_incident_key,
     build_similarity_document,
+    build_topic_document,
     canonicalize_url,
-    find_near_duplicate,
+    find_near_duplicate_candidates,
     find_near_duplicate_pairs,
-    find_topic_duplicate,
+    find_topic_duplicate_from_documents,
 )
 from app.detection.attack_classifier import AttackClassifier
 from app.detection.victim_extractor import VictimExtractor
@@ -71,13 +72,6 @@ class _DigestQueueEntry:
 
 
 @dataclass(frozen=True)
-class _NearDuplicateResult:
-    article_id: int
-    score: float
-    title: str
-
-
-@dataclass(frozen=True)
 class _TopicDuplicateResult:
     article_id: int
     score: float
@@ -93,6 +87,14 @@ class _FetchedCandidate:
     fingerprint: str
     content_hash: str
     similarity_document: str
+    topic_document: str
+    original_index: int
+
+
+@dataclass(frozen=True)
+class _PreparedInput:
+    item: SourceArticle
+    canonical_url: str
     original_index: int
 
 
@@ -100,8 +102,39 @@ class _FetchedCandidate:
 class _RecentArticle:
     article_id: int
     title: str
-    abstract: str
-    text: str
+    published_at: datetime | None
+    created_at: datetime | None
+    similarity_document: str
+    topic_document: str
+
+
+@dataclass
+class _RunDedupeContext:
+    existing_canonical_urls: set[str]
+    content_hash_article_ids: dict[str, int]
+    fingerprint_ids: dict[str, int]
+    recent_articles: list[_RecentArticle]
+    near_duplicate_max_comparisons: int
+
+    @property
+    def similarity_documents(self) -> list[str]:
+        return [article.similarity_document for article in self.recent_articles]
+
+    def add_recent_article(self, article_id: int, title: str, abstract: str, text: str, published_at: datetime | None) -> None:
+        if self.near_duplicate_max_comparisons <= 0:
+            return
+        self.recent_articles.insert(
+            0,
+            _RecentArticle(
+                article_id=article_id,
+                title=title,
+                published_at=published_at,
+                created_at=datetime.now(timezone.utc),
+                similarity_document=build_similarity_document(title, abstract, text),
+                topic_document=build_topic_document(title, abstract, text),
+            ),
+        )
+        del self.recent_articles[self.near_duplicate_max_comparisons :]
 
 
 class MonitorPipeline:
@@ -144,23 +177,51 @@ class MonitorPipeline:
         self.digest_topic_dedupe_lookback_hours = digest_topic_dedupe_lookback_hours
 
     def run(self, articles: list[SourceArticle]) -> PipelineMetrics:
-        metrics = PipelineMetrics()
+        metrics = PipelineMetrics(processed=len(articles))
         digest_queue: list[_DigestQueueEntry] = []
+        prepared_inputs: list[_PreparedInput] = []
         candidates: list[_FetchedCandidate] = []
 
         for original_index, item in enumerate(articles):
             try:
-                candidate = self._prepare_candidate(item, original_index)
+                prepared_inputs.append(
+                    _PreparedInput(
+                        item=item,
+                        canonical_url=canonicalize_url(item.url),
+                        original_index=original_index,
+                    )
+                )
             except Exception as exc:
                 logger.exception("Unhandled processing failure url=%s error=%s", item.url, exc)
-                metrics = metrics.add(processed=1, errors=1)
+                metrics = metrics.add(errors=1)
+                continue
+
+        context = self._build_run_dedupe_context(prepared_inputs)
+
+        for prepared in prepared_inputs:
+            if prepared.canonical_url in context.existing_canonical_urls:
+                metrics = metrics.add(skipped=1)
+                continue
+
+            try:
+                candidate = self._fetch_candidate(prepared)
+            except Exception as exc:
+                logger.exception("Unhandled processing failure url=%s error=%s", prepared.item.url, exc)
+                metrics = metrics.add(errors=1)
                 continue
 
             if candidate is None:
-                metrics = metrics.add(processed=1, skipped=1)
-            else:
-                candidates.append(candidate)
-                metrics = metrics.add(processed=1)
+                metrics = metrics.add(skipped=1)
+                continue
+            candidates.append(candidate)
+
+        candidates, stored_exact_count = self._filter_stored_exact_duplicates(candidates, context)
+        if stored_exact_count:
+            metrics = metrics.add(skipped=stored_exact_count)
+
+        candidates, stored_near_count = self._filter_stored_near_duplicates(candidates, context)
+        if stored_near_count:
+            metrics = metrics.add(skipped=stored_near_count)
 
         survivors, duplicate_count = self._dedupe_current_run_candidates(candidates)
         if duplicate_count:
@@ -168,21 +229,35 @@ class MonitorPipeline:
 
         for candidate in survivors:
             try:
-                metrics = self._process_prepared(candidate, digest_queue, metrics)
+                metrics = self._process_prepared(candidate, digest_queue, metrics, context)
             except Exception as exc:
                 logger.exception("Unhandled processing failure url=%s error=%s", candidate.item.url, exc)
                 metrics = metrics.add(errors=1)
 
         return self._flush_digest_queue(digest_queue, metrics)
 
-    def _prepare_candidate(self, item: SourceArticle, original_index: int) -> _FetchedCandidate | None:
-        canonical_url = canonicalize_url(item.url)
+    def _build_run_dedupe_context(self, prepared_inputs: list[_PreparedInput]) -> _RunDedupeContext:
+        canonical_urls = {prepared.canonical_url for prepared in prepared_inputs}
+        return _RunDedupeContext(
+            existing_canonical_urls=self._load_existing_canonical_urls(canonical_urls),
+            content_hash_article_ids={},
+            fingerprint_ids={},
+            recent_articles=self._load_recent_articles(),
+            near_duplicate_max_comparisons=self.near_duplicate_max_comparisons,
+        )
 
+    def _load_existing_canonical_urls(self, canonical_urls: set[str]) -> set[str]:
+        if not canonical_urls:
+            return set()
         with self.database.session() as session:
-            existing = session.scalar(select(Article.id).where(Article.canonical_url == canonical_url))
-            if existing:
-                return None
+            return set(
+                session.scalars(
+                    select(Article.canonical_url).where(Article.canonical_url.in_(canonical_urls))
+                ).all()
+            )
 
+    def _fetch_candidate(self, prepared: _PreparedInput) -> _FetchedCandidate | None:
+        item = prepared.item
         content = self.fetcher.fetch(item.url)
         if not content:
             return None
@@ -190,45 +265,119 @@ class MonitorPipeline:
         fingerprint = build_fingerprint(item.title, content.full_text)
         content_hash = build_content_hash(content.full_text)
         similarity_document = build_similarity_document(item.title, content.abstract, content.full_text)
-
-        with self.database.session() as session:
-            content_hash_exists = session.scalar(select(Article.id).where(Article.content_hash == content_hash))
-            if content_hash_exists:
-                logger.info(
-                    "Duplicate content hash detected, skipping url=%s existing_article_id=%s",
-                    item.url,
-                    content_hash_exists,
-                )
-                return None
-
-            fp_exists = session.scalar(
-                select(ArticleFingerprint.id).where(ArticleFingerprint.fingerprint == fingerprint)
-            )
-            if fp_exists:
-                logger.info("Duplicate fingerprint detected, skipping url=%s", item.url)
-                return None
-
-        if self.near_duplicate_enabled:
-            near_duplicate = self._find_near_duplicate(item.title, content.abstract, content.full_text, item.published_at)
-            if near_duplicate is not None:
-                logger.info(
-                    "Near duplicate detected, skipping url=%s matched_article_id=%s score=%.3f matched_title=%s",
-                    item.url,
-                    near_duplicate.article_id,
-                    near_duplicate.score,
-                    near_duplicate.title,
-                )
-                return None
+        topic_document = build_topic_document(item.title, content.abstract, content.full_text)
 
         return _FetchedCandidate(
             item=item,
             content=content,
-            canonical_url=canonical_url,
+            canonical_url=prepared.canonical_url,
             fingerprint=fingerprint,
             content_hash=content_hash,
             similarity_document=similarity_document,
-            original_index=original_index,
+            topic_document=topic_document,
+            original_index=prepared.original_index,
         )
+
+    def _filter_stored_exact_duplicates(
+        self,
+        candidates: list[_FetchedCandidate],
+        context: _RunDedupeContext,
+    ) -> tuple[list[_FetchedCandidate], int]:
+        if not candidates:
+            return candidates, 0
+
+        self._load_existing_exact_keys(candidates, context)
+        survivors: list[_FetchedCandidate] = []
+        duplicate_count = 0
+        for candidate in candidates:
+            content_hash_article_id = context.content_hash_article_ids.get(candidate.content_hash)
+            if content_hash_article_id:
+                logger.info(
+                    "Duplicate content hash detected, skipping url=%s existing_article_id=%s",
+                    candidate.item.url,
+                    content_hash_article_id,
+                )
+                duplicate_count += 1
+                continue
+
+            if candidate.fingerprint in context.fingerprint_ids:
+                logger.info("Duplicate fingerprint detected, skipping url=%s", candidate.item.url)
+                duplicate_count += 1
+                continue
+
+            survivors.append(candidate)
+        return survivors, duplicate_count
+
+    def _load_existing_exact_keys(
+        self,
+        candidates: list[_FetchedCandidate],
+        context: _RunDedupeContext,
+    ) -> None:
+        content_hashes = {candidate.content_hash for candidate in candidates}
+        fingerprints = {candidate.fingerprint for candidate in candidates}
+        if not content_hashes and not fingerprints:
+            return
+
+        with self.database.session() as session:
+            if content_hashes:
+                for content_hash, article_id in session.execute(
+                    select(Article.content_hash, Article.id).where(Article.content_hash.in_(content_hashes))
+                ):
+                    context.content_hash_article_ids.setdefault(content_hash, article_id)
+
+            if fingerprints:
+                for fingerprint, fingerprint_id in session.execute(
+                    select(ArticleFingerprint.fingerprint, ArticleFingerprint.id).where(
+                        ArticleFingerprint.fingerprint.in_(fingerprints)
+                    )
+                ):
+                    context.fingerprint_ids.setdefault(fingerprint, fingerprint_id)
+
+    def _filter_stored_near_duplicates(
+        self,
+        candidates: list[_FetchedCandidate],
+        context: _RunDedupeContext,
+    ) -> tuple[list[_FetchedCandidate], int]:
+        if not self.near_duplicate_enabled or not candidates or not context.recent_articles:
+            return candidates, 0
+
+        allowed_existing_indices = {
+            candidate_index: {
+                article_index
+                for article_index, article in enumerate(context.recent_articles)
+                if self._recent_article_within_window(
+                    article,
+                    candidate.item.published_at,
+                    self.near_duplicate_lookback_hours,
+                )
+            }
+            for candidate_index, candidate in enumerate(candidates)
+        }
+        matches = find_near_duplicate_candidates(
+            [candidate.similarity_document for candidate in candidates],
+            context.similarity_documents,
+            threshold=self.similarity_dedupe_threshold,
+            allowed_existing_indices=allowed_existing_indices,
+        )
+
+        survivors: list[_FetchedCandidate] = []
+        duplicate_count = 0
+        for candidate_index, candidate in enumerate(candidates):
+            match = matches.get(candidate_index)
+            if match is None:
+                survivors.append(candidate)
+                continue
+
+            matched_article = context.recent_articles[match.index]
+            logger.info(
+                "Near duplicate detected, skipping url=%s matched_article_id=%s score=%.3f matched_title=%s",
+                candidate.item.url,
+                matched_article.article_id,
+                match.score,
+                matched_article.title,
+            )
+            duplicate_count += 1
+        return survivors, duplicate_count
 
     def _dedupe_current_run_candidates(
         self,
@@ -323,6 +472,7 @@ class MonitorPipeline:
         candidate: _FetchedCandidate,
         digest_queue: list[_DigestQueueEntry],
         metrics: PipelineMetrics,
+        context: _RunDedupeContext,
     ) -> PipelineMetrics:
         item = candidate.item
         content = candidate.content
@@ -357,16 +507,14 @@ class MonitorPipeline:
             classification.article_type == "incident"
             and classification.attack_type is not None
             and has_confident_victim
-            and not duplicate_incident
         )
         routing_reason = self._routing_reason(classification.article_type, classification.attack_type, has_confident_victim, duplicate_incident)
 
         if self.digest_topic_dedupe_enabled and not immediate_ready:
             topic_duplicate = self._find_digest_topic_duplicate(
-                item.title,
-                content.abstract,
-                content.full_text,
+                candidate,
                 item.published_at,
+                context,
             )
             if topic_duplicate is not None:
                 logger.info(
@@ -453,15 +601,7 @@ class MonitorPipeline:
                         if suppressed_out_of_scope
                         else f"Digest queued: {routing_reason}"
                     )
-                    digest_body = (
-                        f"Title: {item.title}\n"
-                        f"Source: {item.source_name}\n"
-                        f"Routing reason: {routing_reason}\n"
-                        f"Attack type: {classification.attack_type or 'unknown'}\n"
-                        f"Victim: {victim.victim_name or 'n/a'}\n"
-                        f"Published date: {self._published_date(item.published_at)}\n"
-                        f"Article link: {item.url}\n"
-                    )
+                    digest_body = self._build_digest_audit_body(item, classification, victim, routing_reason)
                     if suppressed_out_of_scope:
                         status = "skipped"
                     elif self.digest_enabled and len(digest_queue) < self.digest_max_items_per_run:
@@ -506,6 +646,15 @@ class MonitorPipeline:
             digest_queued=1 if digest_item else 0,
             skipped=1 if suppressed_out_of_scope else 0,
         )
+
+        if article_id is not None:
+            context.add_recent_article(
+                article_id=article_id,
+                title=item.title,
+                abstract=content.abstract,
+                text=content.full_text,
+                published_at=item.published_at,
+            )
 
         if immediate_ready and article_id is not None and alert_id is not None:
             send_status = "sent"
@@ -555,6 +704,23 @@ class MonitorPipeline:
             ),
         )
 
+    def _build_digest_audit_body(
+        self,
+        item: SourceArticle,
+        classification: object,
+        victim: object,
+        routing_reason: str,
+    ) -> str:
+        return (
+            f"Title: {item.title}\n"
+            f"Source: {item.source_name}\n"
+            f"Routing reason: {routing_reason}\n"
+            f"Attack type: {getattr(classification, 'attack_type', None) or 'unknown'}\n"
+            f"Victim: {getattr(victim, 'victim_name', None) or 'n/a'}\n"
+            f"Published date: {self._published_date(item.published_at)}\n"
+            f"Article link: {item.url}\n"
+        )
+
     def _routing_reason(
         self,
         article_type: str,
@@ -593,11 +759,7 @@ class MonitorPipeline:
                 return True
         return False
 
-    def _load_recent_articles(
-        self,
-        candidate_time: datetime | None,
-        lookback_hours: int | None,
-    ) -> list[_RecentArticle]:
+    def _load_recent_articles(self) -> list[_RecentArticle]:
         if self.near_duplicate_max_comparisons <= 0:
             return []
 
@@ -618,50 +780,66 @@ class MonitorPipeline:
         if not rows:
             return []
 
-        candidate_reference = ensure_utc(candidate_time)
-        window = (
-            timedelta(hours=lookback_hours)
-            if lookback_hours is not None and lookback_hours > 0
-            else None
-        )
         articles: list[_RecentArticle] = []
         for article_id, title, abstract, text, published_at, created_at in rows:
-            if candidate_reference is not None and window is not None:
-                reference = ensure_utc(published_at or created_at)
-                if reference is not None and abs(candidate_reference - reference) > window:
-                    continue
-
             articles.append(
                 _RecentArticle(
                     article_id=article_id,
                     title=title,
-                    abstract=abstract,
-                    text=text,
+                    published_at=published_at,
+                    created_at=created_at,
+                    similarity_document=build_similarity_document(title, abstract, text),
+                    topic_document=build_topic_document(title, abstract, text),
                 )
             )
         return articles
 
+    def _recent_articles_for_window(
+        self,
+        recent_articles: list[_RecentArticle],
+        candidate_time: datetime | None,
+        lookback_hours: int | None,
+    ) -> list[_RecentArticle]:
+        return [
+            article
+            for article in recent_articles
+            if self._recent_article_within_window(article, candidate_time, lookback_hours)
+        ]
+
+    def _recent_article_within_window(
+        self,
+        article: _RecentArticle,
+        candidate_time: datetime | None,
+        lookback_hours: int | None,
+    ) -> bool:
+        candidate_reference = ensure_utc(candidate_time)
+        if candidate_reference is None or lookback_hours is None or lookback_hours <= 0:
+            return True
+
+        reference = ensure_utc(article.published_at or article.created_at)
+        if reference is None:
+            return True
+        return abs(candidate_reference - reference) <= timedelta(hours=lookback_hours)
+
     def _find_digest_topic_duplicate(
         self,
-        title: str,
-        abstract: str,
-        text: str,
+        candidate: _FetchedCandidate,
         candidate_time: datetime | None,
+        context: _RunDedupeContext,
     ) -> _TopicDuplicateResult | None:
-        recent_articles = self._load_recent_articles(candidate_time, self.digest_topic_dedupe_lookback_hours)
+        recent_articles = self._recent_articles_for_window(
+            context.recent_articles,
+            candidate_time,
+            self.digest_topic_dedupe_lookback_hours,
+        )
         if not recent_articles:
             return None
 
-        existing_items = [
-            (article.title, article.abstract, article.text)
-            for article in recent_articles
-        ]
-
-        match = find_topic_duplicate(
-            title,
-            abstract,
-            text,
-            existing_items,
+        match = find_topic_duplicate_from_documents(
+            candidate.item.title,
+            candidate.topic_document,
+            [article.title for article in recent_articles],
+            [article.topic_document for article in recent_articles],
             threshold=self.similarity_dedupe_threshold,
         )
         if match is None:
@@ -673,38 +851,6 @@ class MonitorPipeline:
             score=match.score,
             title=matched_article.title,
             shared_title_terms=match.shared_title_terms,
-        )
-
-    def _find_near_duplicate(
-        self,
-        title: str,
-        abstract: str,
-        text: str,
-        candidate_time: datetime | None,
-    ) -> _NearDuplicateResult | None:
-        recent_articles = self._load_recent_articles(candidate_time, self.near_duplicate_lookback_hours)
-        if not recent_articles:
-            return None
-
-        existing_documents = [
-            build_similarity_document(article.title, article.abstract, article.text)
-            for article in recent_articles
-        ]
-
-        candidate_document = build_similarity_document(title, abstract, text)
-        match = find_near_duplicate(
-            candidate_document,
-            existing_documents,
-            threshold=self.similarity_dedupe_threshold,
-        )
-        if match is None:
-            return None
-
-        matched_article = recent_articles[match.index]
-        return _NearDuplicateResult(
-            article_id=matched_article.article_id,
-            score=match.score,
-            title=matched_article.title,
         )
 
     def _flush_digest_queue(

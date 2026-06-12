@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import feedparser
+import requests
 
 from app.fetch.url_guard import UnsafeUrlError, validate_public_http_url
 from app.sources.base import SourceArticle
@@ -23,13 +24,17 @@ class RssSource:
         self,
         feed_url: str,
         max_articles: int,
+        timeout_seconds: int = 15,
         decode_google_news_urls: bool = True,
         source_name_override: str | None = None,
     ) -> None:
         self.feed_url = feed_url
         self.max_articles = max_articles
+        self.timeout_seconds = timeout_seconds
         self.decode_google_news_urls = decode_google_news_urls
         self.source_name_override = source_name_override
+        self._session = requests.Session()
+        self._session.trust_env = False
 
     def _maybe_decode_google_news_url(self, url: str) -> str | None:
         logger.debug(
@@ -99,14 +104,24 @@ class RssSource:
         )
         return None
 
+    def _download_feed(self) -> bytes:
+        safe_feed_url = validate_public_http_url(self.feed_url, require_dns_resolution=False)
+        response = self._session.get(
+            safe_feed_url,
+            timeout=self.timeout_seconds,
+            headers={"User-Agent": "CyberNewsAlert/1.0 (+https://example.local)"},
+        )
+        response.raise_for_status()
+        return response.content
+
     def fetch(self) -> list[SourceArticle]:
         try:
-            safe_feed_url = validate_public_http_url(self.feed_url, require_dns_resolution=False)
-        except UnsafeUrlError as exc:
-            logger.warning("Skipping RSS feed due to unsafe URL feed_url=%s error=%s", self.feed_url, exc)
+            feed_content = self._download_feed()
+        except (requests.RequestException, UnsafeUrlError) as exc:
+            logger.warning("Skipping RSS feed due to fetch failure feed_url=%s error=%s", self.feed_url, exc)
             return []
 
-        parsed = feedparser.parse(safe_feed_url)
+        parsed = feedparser.parse(feed_content)
         source_name = self.source_name_override or parsed.feed.get("title", self.feed_url)
 
         articles: list[SourceArticle] = []

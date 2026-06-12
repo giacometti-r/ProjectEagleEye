@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 
 from app.alerts.emailer import AlertEmail, DigestEmailItem
 from app.config import Settings
@@ -30,6 +30,16 @@ class UrlMapFetcher(FakeFetcher):
 
     def fetch(self, url: str) -> ArticleContent | None:
         return self.content_by_url[url]
+
+
+class CountingUrlMapFetcher(UrlMapFetcher):
+    def __init__(self, content_by_url: dict[str, ArticleContent]) -> None:
+        self.calls: list[str] = []
+        super().__init__(content_by_url)
+
+    def fetch(self, url: str) -> ArticleContent | None:
+        self.calls.append(url)
+        return super().fetch(url)
 
 
 class FakeClassifier:
@@ -949,6 +959,136 @@ def test_pipeline_skips_near_duplicate_before_digest_or_alert() -> None:
         assert len(session.scalars(select(Article)).all()) == 1
 
 
+def test_pipeline_skips_stored_near_duplicate_from_cached_recent_articles() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/stored-near": ArticleContent(
+                full_text="WhatsApp disrupted NSO spyware phishing attacks against users.",
+                abstract="WhatsApp disrupted NSO-linked spyware phishing attacks.",
+            ),
+            "https://example.com/new-near": ArticleContent(
+                full_text="Meta said WhatsApp disrupted new spyware phishing attacks linked to NSO Group.",
+                abstract="WhatsApp disrupted NSO-linked spyware phishing activity.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+    )
+
+    now = datetime.now(timezone.utc)
+    first_metrics = pipeline.run(
+        [
+            SourceArticle(
+                "s1",
+                "rss",
+                "WhatsApp says it disrupted new NSO spyware phishing attacks",
+                "https://example.com/stored-near",
+                now,
+            )
+        ]
+    )
+    second_metrics = pipeline.run(
+        [
+            SourceArticle(
+                "s2",
+                "rss",
+                "WhatsApp says it disrupted new NSO spyware phishing attacks - BleepingComputer",
+                "https://example.com/new-near",
+                now + timedelta(minutes=5),
+            )
+        ]
+    )
+
+    assert first_metrics.alerts_sent == 1
+    assert second_metrics.processed == 1
+    assert second_metrics.skipped == 1
+    assert second_metrics.alerts_sent == 0
+    assert len(emailer.sent) == 1
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 1
+
+
+def test_pipeline_batches_stored_exact_key_skips() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    content_seed = ArticleContent(
+        full_text="Stored article body about Acme Corp phishing.",
+        abstract="Stored article abstract.",
+    )
+    fingerprint_prefix = "Acme Corp phishing incident shared fingerprint prefix " * 120
+    fetcher = CountingUrlMapFetcher(
+        {
+            "https://example.com/stored?utm_source=seed": content_seed,
+            "https://example.com/fingerprint-seed": ArticleContent(
+                full_text=f"{fingerprint_prefix}original trailing details",
+                abstract="Fingerprint seed abstract.",
+            ),
+            "https://example.com/content-duplicate": content_seed,
+            "https://example.com/fingerprint-duplicate": ArticleContent(
+                full_text=f"{fingerprint_prefix}changed trailing details",
+                abstract="Fingerprint duplicate abstract.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        near_duplicate_enabled=False,
+        digest_topic_dedupe_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    pipeline.run(
+        [
+            SourceArticle("seed", "rss", "Stored content seed", "https://example.com/stored?utm_source=seed", now),
+            SourceArticle(
+                "seed",
+                "rss",
+                "Stored fingerprint seed",
+                "https://example.com/fingerprint-seed",
+                now + timedelta(minutes=1),
+            ),
+        ]
+    )
+
+    metrics = pipeline.run(
+        [
+            SourceArticle("dup", "rss", "Stored canonical duplicate", "https://example.com/stored", now),
+            SourceArticle("dup", "rss", "Different title for stored content", "https://example.com/content-duplicate", now),
+            SourceArticle(
+                "dup",
+                "rss",
+                "Stored fingerprint seed",
+                "https://example.com/fingerprint-duplicate",
+                now,
+            ),
+        ]
+    )
+
+    assert metrics.processed == 3
+    assert metrics.skipped == 3
+    assert metrics.errors == 0
+    assert "https://example.com/stored" not in fetcher.calls
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 2
+
+
 def test_pipeline_suppresses_out_of_scope_digest_item() -> None:
     database = Database(_settings("sqlite+pysqlite:///:memory:"))
     initialize_schema(database)
@@ -991,3 +1131,19 @@ def test_pipeline_suppresses_out_of_scope_digest_item() -> None:
         assert alert.channel == "digest"
         assert alert.routing_reason == "out_of_scope"
         assert alert.status == "skipped"
+
+
+def test_initialize_schema_creates_hot_path_indexes() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    inspector = inspect(database.engine)
+    article_indexes = {index["name"] for index in inspector.get_indexes("articles")}
+    alert_indexes = {index["name"] for index in inspector.get_indexes("alerts")}
+    fingerprint_indexes = {index["name"] for index in inspector.get_indexes("article_fingerprints")}
+
+    assert "ix_articles_content_hash" in article_indexes
+    assert "ix_articles_created_at" in article_indexes
+    assert "ix_articles_published_at" in article_indexes
+    assert "ix_alerts_article_id" in alert_indexes
+    assert "ix_article_fingerprints_article_id" in fingerprint_indexes

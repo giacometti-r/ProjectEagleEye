@@ -18,6 +18,7 @@ Scope includes tracked project files under:
 - `tests/`
 - `Dockerfile`
 - `requirements.txt`
+- `requirements-dev.txt`
 - `.github/workflows/`
 - `k8s/`
 - `.sops.yaml`
@@ -36,7 +37,8 @@ Scope excludes `.git` internals and cache artifacts (for example `__pycache__`, 
 - `README.md`: operator-focused usage and feature overview.
 - `README_TECHNICAL.md`: this deep technical reference.
 - `LICENSE`: MIT license terms.
-- `requirements.txt`: Python dependency lock list (pinned versions).
+- `requirements.txt`: runtime Python dependency lock list (pinned versions).
+- `requirements-dev.txt`: CI/local test dependency list layered on runtime pins.
 - `Dockerfile`: production runtime image build.
 - `.github/workflows/`: pull request validation and main-branch image/GitOps pipeline.
 - `k8s/`: Kubernetes base, production overlay, SOPS-ready Secret, and Argo CD Application.
@@ -73,6 +75,7 @@ Scope excludes `.git` internals and cache artifacts (for example `__pycache__`, 
 - `test_victim_extractor.py`: victim extraction quality/noise rejection behavior.
 - `test_deduplicator.py`: dedupe normalization/hash stability behavior.
 - `test_emailer.py`: email formatting and digest grouping behavior.
+- `test_sources.py`: RSS source download, timeout, and unsafe-feed behavior.
 - `test_pipeline.py`: integration-lite pipeline persistence/routing/send-state contracts.
 
 ### 2.4 Ops
@@ -114,11 +117,12 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 
 `MonitorPipeline.run()` executes the processing graph in three phases:
 
-1. Candidate preparation for every fetched `SourceArticle`:
-   - Canonical URL DB dedupe check (`canonicalize_url` + DB lookup on `Article.canonical_url`).
+1. Candidate preparation for fetched `SourceArticle` items:
+   - Canonical URL normalization plus one batched DB lookup on `Article.canonical_url` before article-body fetch.
    - Remote article fetch and parse (`ArticleFetcher.fetch`), skip on failure.
-   - Fingerprint/content hash/similarity document generation.
-   - Exact content-hash, fingerprint, and optional near-duplicate DB checks.
+   - Fingerprint/content hash/similarity/topic document generation.
+   - One batched stored content-hash/fingerprint lookup after fetch.
+   - One cached recent-article load for stored near-duplicate checks, with precomputed similarity/topic documents reused during the run.
 2. Current-run batch dedupe across prepared candidates:
    - Groups exact matches by canonical URL, content hash, and fingerprint.
    - Groups near-duplicates with TF-IDF cosine similarity when enabled.
@@ -150,7 +154,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 2. Stored canonical URL dedupe (`articles.canonical_url` unique).
 3. Stored exact content hash dedupe (`articles.content_hash` lookup).
 4. Stored fingerprint dedupe (`article_fingerprints.fingerprint` unique).
-5. Stored near-duplicate dedupe (`TfidfVectorizer` + cosine similarity over recent stored articles).
+5. Stored near-duplicate dedupe (`TfidfVectorizer` + cosine similarity over cached recent stored articles).
 6. Current-run exact dedupe by canonical URL, content hash, and fingerprint.
 7. Current-run near-duplicate dedupe using the same similarity threshold/window settings.
 8. Incident-window dedupe (`articles.incident_key` + temporal comparison).
@@ -302,12 +306,12 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
   - `id` PK autoincrement.
   - `source_name`, `source_type`, `title`, `url`.
   - `canonical_url` unique.
-  - `published_at` nullable timezone-aware datetime.
+  - `published_at` nullable timezone-aware datetime, indexed for time-window comparisons.
   - `article_text`, `abstract`.
   - `article_type`, `attack_type`, `victim_name`, `victim_category`.
   - `incident_key` nullable indexed string.
-  - `content_hash`.
-  - `created_at` server default `now()`.
+  - `content_hash` indexed for stored exact-body dedupe.
+  - `created_at` server default `now()`, indexed for recent-article scans.
 - Relationships:
   - `fingerprints` one-to-many `ArticleFingerprint` (cascade delete-orphan).
   - `alerts` one-to-many `Alert` (cascade delete-orphan).
@@ -319,7 +323,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 - Constraints:
   - `UniqueConstraint("fingerprint", name="uq_article_fingerprint")`.
 - Columns:
-  - `id`, `article_id` FK(`articles.id`, cascade delete), `fingerprint`, `created_at`.
+  - `id`, indexed `article_id` FK(`articles.id`, cascade delete), `fingerprint`, `created_at`.
 - Relationship:
   - `article` many-to-one back-populated.
 
@@ -328,7 +332,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 - Purpose: notification history for immediate and digest channels.
 - Table: `alerts`.
 - Columns:
-  - `id`, `article_id` FK(`articles.id`, cascade delete).
+  - `id`, indexed `article_id` FK(`articles.id`, cascade delete).
   - `recipient_email`.
   - `channel` (`immediate` or `digest`).
   - `routing_reason` nullable.
@@ -348,6 +352,13 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
   - Uses `inspect(conn).get_columns(table_name)`.
   - Executes provided DDL only when `column_name` absent.
 
+#### `_add_index_if_missing(conn, table_name, index_name, ddl) -> None`
+
+- Purpose: idempotent compatibility helper for hot-path index creation.
+- Behavior:
+  - Uses `inspect(conn).get_indexes(table_name)`.
+  - Executes provided DDL only when `index_name` absent.
+
 #### `initialize_schema(database: Database) -> None`
 
 - Purpose: initialize/create schema and apply targeted compatibility changes.
@@ -359,6 +370,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
     - Ensure `articles.incident_key` exists.
     - Ensure `alerts.channel` exists.
     - Ensure `alerts.routing_reason` exists.
+    - Ensure hot-path indexes exist for content-hash, created/published time, alert FK, and fingerprint FK lookups.
 - Side effects: DDL execution on target DB.
 
 ---
@@ -377,11 +389,11 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 - Purpose: drop dated source items older than the configured freshness window before body fetch/classification.
 - Behavior: `max_age_hours <= 0` disables filtering; missing timestamps are retained.
 
-#### `gather_articles(settings: object) -> list[SourceArticle]`
+#### `gather_articles(settings: Settings) -> list[SourceArticle]`
 
 - Purpose: construct sources from settings and aggregate articles.
 - Inputs:
-  - `settings`: either concrete `Settings` or any object; non-`Settings` triggers `load_settings()`.
+  - `settings`: concrete `Settings`; callers load settings before invoking.
 - Output: list of `SourceArticle` sorted newest-first.
 - Side effects:
   - Network calls through source adapters.
@@ -436,11 +448,6 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 - Fields: `alert_id`, `item: DigestEmailItem`.
 - Purpose: binds persisted digest alert row to later digest email payload.
 
-#### `_NearDuplicateResult` (`@dataclass(frozen=True)`)
-
-- Fields: `article_id`, `score`, `title`.
-- Purpose: carries the best TF-IDF cosine match for logging and skip decisions.
-
 #### `_TopicDuplicateResult` (`@dataclass(frozen=True)`)
 
 - Fields: `article_id`, `score`, `title`, `shared_title_terms`.
@@ -448,13 +455,24 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 
 #### `_FetchedCandidate` (`@dataclass(frozen=True)`)
 
-- Fields: `item`, `content`, `canonical_url`, `fingerprint`, `content_hash`, `similarity_document`, `original_index`.
+- Fields: `item`, `content`, `canonical_url`, `fingerprint`, `content_hash`, `similarity_document`, `topic_document`, `original_index`.
 - Purpose: carries fetched article content and dedupe keys between preparation, current-run dedupe, and survivor processing.
+
+#### `_PreparedInput` (`@dataclass(frozen=True)`)
+
+- Fields: `item`, `canonical_url`, `original_index`.
+- Purpose: carries canonicalized source items after the batched stored canonical-URL check and before article fetch.
 
 #### `_RecentArticle` (`@dataclass(frozen=True)`)
 
-- Fields: `article_id`, `title`, `abstract`, `text`.
-- Purpose: normalized payload loaded once for stored near-duplicate and digest-topic duplicate checks.
+- Fields: `article_id`, `title`, `published_at`, `created_at`, `similarity_document`, `topic_document`.
+- Purpose: normalized payload loaded once per run for stored near-duplicate and digest-topic duplicate checks.
+
+#### `_RunDedupeContext` (`@dataclass`)
+
+- Fields: stored canonical URL set, stored content-hash/fingerprint maps, cached recent articles, comparison cap.
+- Purpose: mutable per-run cache for batched DB dedupe and current-run additions visible to digest-topic checks.
+- `add_recent_article(...)`: appends a newly persisted article to the run cache while honoring `near_duplicate_max_comparisons`.
 
 #### `MonitorPipeline`
 
@@ -467,13 +485,24 @@ Constructor:
 Methods:
 
 - `run(articles: list[SourceArticle]) -> PipelineMetrics`
-  - Prepares fetched candidates, dedupes the current run in memory, processes survivors, and flushes digest.
+  - Canonicalizes inputs, performs batched stored-key checks, fetches candidates, dedupes the current run in memory, processes survivors, and flushes digest.
   - Counts every input article as processed; skips DB duplicates, fetch failures, and current-run duplicate losers.
   - Catches unhandled per-item exceptions, increments `errors`, continues run.
 
-- `_prepare_candidate(item, original_index) -> _FetchedCandidate | None`
-  - Canonicalizes URL, checks stored canonical duplicates, fetches content, builds dedupe keys, and checks stored content-hash/fingerprint/near-duplicate matches.
-  - Returns `None` for skipped candidates before classification or persistence.
+- `_build_run_dedupe_context(prepared_inputs) -> _RunDedupeContext`
+  - Loads stored canonical URL matches and recent article similarity/topic documents once for the run.
+
+- `_load_existing_canonical_urls(canonical_urls) -> set[str]`
+  - Performs a batched lookup for already-stored canonical URLs.
+
+- `_fetch_candidate(prepared) -> _FetchedCandidate | None`
+  - Fetches article content and builds fingerprint, content-hash, similarity, and topic documents.
+
+- `_filter_stored_exact_duplicates(candidates, context) -> tuple[list[_FetchedCandidate], int]`
+  - Applies batched stored content-hash and fingerprint duplicate checks.
+
+- `_filter_stored_near_duplicates(candidates, context) -> tuple[list[_FetchedCandidate], int]`
+  - Applies batched TF-IDF candidate-vs-recent comparisons using cached recent documents and per-candidate lookback windows.
 
 - `_dedupe_current_run_candidates(candidates) -> tuple[list[_FetchedCandidate], int]`
   - Groups prepared candidates by exact dedupe keys and optional near-duplicate similarity.
@@ -486,17 +515,21 @@ Methods:
 - `_within_near_duplicate_window(left, right) -> bool`
   - Applies `near_duplicate_lookback_hours` to current-run near-duplicate pairs when both timestamps are known.
 
-- `_process_prepared(candidate, digest_queue, metrics) -> PipelineMetrics`
+- `_process_prepared(candidate, digest_queue, metrics, context) -> PipelineMetrics`
   - Full survivor flow (classify, extract, incident dedupe, persist, send/queue).
   - Keeps final canonical/content-hash/fingerprint DB guards for concurrent-run races.
   - Skips duplicate incidents before persistence instead of queueing them into digest.
   - Skips non-immediate digest-topic duplicates before persistence.
   - Stores out-of-scope articles as skipped digest alerts when suppression is enabled.
+  - Adds successfully persisted articles to the run dedupe context for later same-run topic checks.
   - Handles DB duplicate races via `IntegrityError` rollback and skip accounting.
   - Immediate send failures do not increment `errors`; they mark alert row as `failed`.
 
 - `_build_immediate_email(item, content, classification, victim) -> AlertEmail`
   - Builds the immediate alert subject/body once for persistence and SMTP send.
+
+- `_build_digest_audit_body(item, classification, victim, routing_reason) -> str`
+  - Builds the persisted digest placeholder/audit body for queued or skipped digest alerts.
 
 - `_routing_reason(article_type, attack_type, has_confident_victim, duplicate_incident) -> str`
   - Routing decision helper.
@@ -506,19 +539,19 @@ Methods:
   - Finds prior articles with same incident key and compares UTC time delta to configured window.
   - If candidate time is missing but matches exist, returns `True` conservatively.
 
-- `_load_recent_articles(candidate_time, lookback_hours) -> list[_RecentArticle]`
-  - Loads recent stored article text/metadata up to `near_duplicate_max_comparisons`.
-  - Applies the supplied lookback window when candidate time is known.
+- `_load_recent_articles() -> list[_RecentArticle]`
+  - Loads recent stored article text/metadata up to `near_duplicate_max_comparisons` and precomputes similarity/topic documents.
 
-- `_find_digest_topic_duplicate(title, abstract, text, candidate_time) -> _TopicDuplicateResult | None`
-  - Uses `_load_recent_articles()` with digest-topic lookback settings.
+- `_recent_articles_for_window(recent_articles, candidate_time, lookback_hours) -> list[_RecentArticle]`
+  - Filters cached recent articles according to the candidate timestamp and supplied lookback.
+
+- `_recent_article_within_window(article, candidate_time, lookback_hours) -> bool`
+  - Shared time-window predicate for stored near-duplicate and digest-topic checks.
+
+- `_find_digest_topic_duplicate(candidate, candidate_time, context) -> _TopicDuplicateResult | None`
+  - Uses cached recent articles with digest-topic lookback settings.
   - Applies `digest_topic_dedupe_lookback_hours` when candidate time is known.
-  - Uses `find_topic_duplicate()` over title + abstract + article-text prefix and requires shared salient title terms.
-
-- `_find_near_duplicate(title, abstract, text, candidate_time) -> _NearDuplicateResult | None`
-  - Uses `_load_recent_articles()` with near-duplicate lookback settings.
-  - Applies `near_duplicate_lookback_hours` when candidate time is known.
-  - Uses `build_similarity_document()` and `find_near_duplicate()` to find the best match.
+  - Uses precomputed topic documents and requires shared salient title terms.
 
 - `_flush_digest_queue(digest_queue, metrics) -> PipelineMetrics`
   - Sends one digest email when enabled and queue non-empty.
@@ -538,11 +571,6 @@ Methods:
 
 - Fields: `title`, `source_name`, `routing_reason`, `link`, `published_date`, optional `attack_type`, optional `victim_name`.
 - Purpose: digest-line render input.
-
-#### `SmtpClient(Protocol)`
-
-- Method contract: `send_message(msg: EmailMessage) -> None`.
-- Purpose: structural typing hint for SMTP-like clients (not directly injected in current implementation).
 
 #### `Emailer`
 
@@ -596,6 +624,11 @@ Methods:
 
 - Fields: `left_index`, `right_index`, `score`.
 - Purpose: reports a current-run document pair whose cosine score meets the near-duplicate threshold.
+
+#### `TopicDuplicateMatch` (`@dataclass(frozen=True)`)
+
+- Fields: `index`, `score`, `shared_title_terms`.
+- Purpose: reports the matching topic-document index, cosine score, and headline evidence.
 
 #### `normalize_incident_entity(value: str) -> str`
 
@@ -656,6 +689,14 @@ Methods:
   - Returns the best match only when score is at least `threshold`.
   - Returns `None` for empty corpora or empty vectorizer vocabularies.
 
+#### `find_near_duplicate_candidates(candidate_documents, existing_documents, threshold, allowed_existing_indices=None) -> dict[int, SimilarityMatch]`
+
+- Purpose: batch candidate-vs-existing near-duplicate detection with one TF-IDF vectorization pass.
+- Behavior:
+  - Uses English stop words and unigram/bigram features.
+  - Optionally restricts allowed existing document indexes per candidate for lookback-window filtering.
+  - Returns candidate-index keyed best matches at or above `threshold`.
+
 #### `find_topic_duplicate(candidate_title, candidate_abstract, candidate_text, existing_items, threshold) -> TopicDuplicateMatch | None`
 
 - Purpose: detect digest-topic duplicates with title+abstract+text similarity plus salient-title overlap.
@@ -663,6 +704,11 @@ Methods:
   - Uses English stop words and unigram/bigram features over `build_topic_document()`.
   - Checks candidate matches from highest to lowest score.
   - Returns the first score above threshold that also has shared salient title terms.
+
+#### `find_topic_duplicate_from_documents(candidate_title, candidate_document, existing_titles, existing_documents, threshold) -> TopicDuplicateMatch | None`
+
+- Purpose: digest-topic duplicate detection using precomputed topic documents.
+- Behavior: same scoring and salient-title evidence rules as `find_topic_duplicate()`, without rebuilding stored documents.
 
 #### `find_near_duplicate_pairs(documents, threshold) -> list[SimilarityPair]`
 
@@ -877,8 +923,11 @@ Methods:
 
 #### `RssSource`
 
-- `__init__(feed_url, max_articles, decode_google_news_urls=True, source_name_override=None)`
-  - Configures feed adapter and optional Google URL decode behavior.
+- `__init__(feed_url, max_articles, timeout_seconds=15, decode_google_news_urls=True, source_name_override=None)`
+  - Configures feed adapter, explicit request timeout, isolated `requests.Session(trust_env=False)`, and optional Google URL decode behavior.
+
+- `_download_feed() -> bytes`
+  - Validates the feed URL, performs an explicit timed HTTP GET with static UA, raises request/URL errors on failure.
 
 - `_maybe_decode_google_news_url(url) -> str | None`
   - If non-Google host: returns original URL.
@@ -886,7 +935,7 @@ Methods:
   - If decoder status + URL present: returns decoded direct URL.
 
 - `fetch() -> list[SourceArticle]`
-  - Parses RSS/Atom feed with `feedparser`.
+  - Downloads and parses RSS/Atom feed content with `feedparser`.
   - Iterates capped entries, validates title/link, optional Google decode, parses published timestamp.
   - Emits `SourceArticle` list with `source_type='rss'`.
   - Logs fetched count.
@@ -895,10 +944,10 @@ Methods:
 
 #### `GoogleNewsRssSource(RssSource)`
 
-- `__init__(query, max_articles, language='en-US', region='US', recency_window='7d')`
+- `__init__(query, max_articles, language='en-US', region='US', recency_window='7d', timeout_seconds=15)`
   - Appends `when:<window>` constraint to query.
   - Builds Google News RSS URL with quoted params (`q`, `hl`, `gl`, `ceid`).
-  - Calls `RssSource.__init__` with `source_name_override='Google News'`.
+  - Calls `RssSource.__init__` with `timeout_seconds` and `source_name_override='Google News'`.
 
 ## 6.12 `app/sources/gdelt.py`
 
@@ -1022,7 +1071,16 @@ This section maps each test symbol to the production behavior it validates.
 - `test_extract_text_handles_tag_with_missing_attrs_dict()`
   - Confirms robust text extraction when malformed BeautifulSoup tag attrs are `None`.
 
-## 7.6 `tests/test_pipeline.py`
+## 7.6 `tests/test_sources.py`
+
+- `test_rss_source_fetches_with_timeout_and_isolated_session()`
+  - Confirms RSS fetching uses explicit timeout, static UA, and `trust_env=False`.
+- `test_rss_source_rejects_unsafe_feed_url()`
+  - Confirms unsafe feed URLs are rejected before any HTTP request.
+- `test_rss_source_returns_empty_on_fetch_failure()`
+  - Confirms RSS fetch request failures return an empty source result.
+
+## 7.7 `tests/test_pipeline.py`
 
 ### Helper Test Doubles
 
@@ -1085,16 +1143,24 @@ This section maps each test symbol to the production behavior it validates.
   - Contract: identical fetched article bodies are stored/sent once even with different URLs.
 - `test_pipeline_skips_near_duplicate_before_digest_or_alert()`
   - Contract: TF-IDF near-duplicates are skipped before immediate or digest routing.
+- `test_pipeline_skips_stored_near_duplicate_from_cached_recent_articles()`
+  - Contract: a second run skips a stored near-duplicate using the run-level recent-article cache.
+- `test_pipeline_batches_stored_exact_key_skips()`
+  - Contract: stored canonical, content-hash, and fingerprint duplicates are skipped through batched checks; canonical duplicates are not fetched.
 - `test_pipeline_suppresses_out_of_scope_digest_item()`
   - Contract: out-of-scope articles are stored as skipped digest alerts and are not emailed.
+- `test_initialize_schema_creates_hot_path_indexes()`
+  - Contract: schema initialization creates hot-path indexes for dedupe and FK lookups.
 
 ---
 
 ## 8. Infrastructure and Operations Reference
 
-## 8.1 `requirements.txt`
+## 8.1 Dependency Manifests
 
-Pinned dependencies and primary usage:
+`requirements.txt` contains runtime pins used by Docker. `requirements-dev.txt` includes `-r requirements.txt` plus local/CI test tooling.
+
+Runtime dependencies and primary usage:
 
 - `beautifulsoup4`: HTML parsing and DOM cleanup.
 - `feedparser`: RSS/Atom parsing.
@@ -1104,8 +1170,8 @@ Pinned dependencies and primary usage:
 - `SQLAlchemy`: ORM and DB access.
 - `tenacity`: retry policies for network calls.
 - `python-dateutil`: robust datetime parsing (`gdelt seendate`).
-- `pytest`: tests.
 - `scikit-learn`: TF-IDF vectorization and cosine similarity for near-duplicate detection.
+- `pytest` in `requirements-dev.txt`: tests.
 
 ## 8.2 `Dockerfile`
 
@@ -1114,7 +1180,7 @@ Build behavior:
 1. Base image: `python:3.11-slim`.
 2. Environment flags: `PYTHONDONTWRITEBYTECODE=1`, `PYTHONUNBUFFERED=1`.
 3. Creates non-root user `appuser`.
-4. Installs Python dependencies from `requirements.txt`.
+4. Installs runtime Python dependencies from `requirements.txt`.
 5. Copies `app/`.
 6. Switches to non-root execution.
 7. Default command: `python -m app.main`.
@@ -1130,8 +1196,8 @@ Build behavior:
 
 ## 8.4 GitHub Actions
 
-- `.github/workflows/pull-request.yml`: installs dependencies, runs tests, and builds the Docker image on pull requests.
-- `.github/workflows/deploy.yml`: on `main`, runs tests, pushes the image to GHCR, updates the Kustomize image tag, and commits the GitOps update.
+- `.github/workflows/pull-request.yml`: installs `requirements-dev.txt`, runs tests, and builds the Docker image on pull requests.
+- `.github/workflows/deploy.yml`: on `main`, installs `requirements-dev.txt`, runs tests, pushes the runtime image to GHCR, updates the Kustomize image tag, and commits the GitOps update.
 
 ## 8.5 `.gitignore`
 

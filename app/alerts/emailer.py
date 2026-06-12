@@ -5,7 +5,6 @@ import smtplib
 import ssl
 from dataclasses import dataclass
 from email.message import EmailMessage
-from typing import Protocol
 
 
 @dataclass(frozen=True)
@@ -23,11 +22,6 @@ class DigestEmailItem:
     published_date: str
     attack_type: str | None = None
     victim_name: str | None = None
-
-
-class SmtpClient(Protocol):
-    def send_message(self, msg: EmailMessage) -> None:
-        ...
 
 
 class Emailer:

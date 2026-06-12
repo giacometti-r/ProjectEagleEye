@@ -1,2 +1,2 @@
-- Automatically save logs once CronJob completed
-- Run security audit
+- Add structured runtime metrics for source counts, dedupe skip reasons, and send outcomes.
+- Add an operator command or documented kubectl flow to archive completed CronJob logs.

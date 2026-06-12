@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from app.alerts.emailer import Emailer
-from app.config import load_settings
+from app.config import Settings, load_settings
 from app.db import Database
 from app.detection.attack_classifier import AttackClassifier
 from app.detection.victim_extractor import VictimExtractor
@@ -41,17 +41,26 @@ def _filter_fresh_articles(articles: list[SourceArticle], max_age_hours: int) ->
     return fresh_articles
 
 
-def gather_articles(settings: object) -> list[SourceArticle]:
-    from app.config import Settings
-
-    cfg = settings if isinstance(settings, Settings) else load_settings()
-
+def gather_articles(settings: Settings) -> list[SourceArticle]:
+    cfg = settings
     sources = []
     for feed_url in cfg.rss_feeds:
-        sources.append(RssSource(feed_url=feed_url, max_articles=cfg.max_articles_per_source))
+        sources.append(
+            RssSource(
+                feed_url=feed_url,
+                max_articles=cfg.max_articles_per_source,
+                timeout_seconds=cfg.request_timeout_seconds,
+            )
+        )
 
     for query in cfg.google_news_queries:
-        sources.append(GoogleNewsRssSource(query=query, max_articles=cfg.max_articles_per_source))
+        sources.append(
+            GoogleNewsRssSource(
+                query=query,
+                max_articles=cfg.max_articles_per_source,
+                timeout_seconds=cfg.request_timeout_seconds,
+            )
+        )
 
     if cfg.enable_gdelt:
         combined_query = (
