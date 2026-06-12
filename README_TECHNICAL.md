@@ -54,6 +54,7 @@ Scope excludes `.git` internals and cache artifacts (for example `__pycache__`, 
 - `models.py`: ORM schema.
 - `schema_init.py`: idempotent schema bootstrap and targeted backfill.
 - `logging_config.py`: global logging setup.
+- `time_utils.py`: shared datetime normalization helpers.
 - `alerts/emailer.py`: SMTP subject/body rendering and send behavior.
 - `fetch/article_fetcher.py`: HTTP download, article text extraction, abstract generation.
 - `detection/attack_classifier.py`: article type + attack taxonomy classification.
@@ -197,6 +198,22 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 - Output: non-empty string value.
 - Failure: raises `ConfigError` if unset/empty.
 
+#### `_parse_bool_env(name: str, default: bool) -> bool`
+
+- Purpose: parse truthy env flags using `{1,true,yes}` with a typed default.
+
+#### `_parse_int_env(name: str, default: int) -> int`
+
+- Purpose: parse integer env settings with a typed default.
+
+#### `_parse_optional_int_env(name: str) -> int | None`
+
+- Purpose: parse optional integer env settings where unset/empty maps to `None`.
+
+#### `_parse_float_env(name: str, default: float) -> float`
+
+- Purpose: parse float env settings with a typed default.
+
 #### `_parse_list_env(name: str, default: list[str]) -> list[str]`
 
 - Purpose: parse env list settings from JSON array or comma-separated string.
@@ -241,7 +258,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 | `min_victim_confidence` | `MIN_VICTIM_CONFIDENCE` | `float` | no | `0.65` | `float(...)` | Threshold for immediate-channel eligibility. |
 | `incident_dedupe_window_hours` | `INCIDENT_DEDUPE_WINDOW_HOURS` | `int` | no | `48` | `int(...)` | Time window for incident-key suppression. |
 | `near_duplicate_enabled` | `NEAR_DUPLICATE_ENABLED` | `bool` | no | `true` | truthy set | Enables TF-IDF cosine near-duplicate skips. |
-| `near_duplicate_threshold` | `NEAR_DUPLICATE_THRESHOLD` | `float` | no | `0.78` | `float(...)` | Minimum cosine score for near-duplicate skip. |
+| `similarity_dedupe_threshold` | `SIMILARITY_DEDUPE_THRESHOLD` | `float` | no | `0.30` | `float(...)` | Minimum TF-IDF cosine score shared by alert near-duplicate, current-run near-duplicate, and digest-topic duplicate checks. |
 | `near_duplicate_lookback_hours` | `NEAR_DUPLICATE_LOOKBACK_HOURS` | `int \| None` | no | fallback to incident window | optional `int(...)` | Time window for candidate comparison. |
 | `near_duplicate_max_comparisons` | `NEAR_DUPLICATE_MAX_COMPARISONS` | `int` | no | `500` | `int(...)` | Max recent articles loaded for similarity comparison. |
 | `suppress_out_of_scope_digest` | `SUPPRESS_OUT_OF_SCOPE_DIGEST` | `bool` | no | `true` | truthy set | Stores but does not send out-of-scope digest items. |
@@ -249,7 +266,6 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 | `digest_recipient_email` | `DIGEST_RECIPIENT_EMAIL` | `str` | conditional | fallback to `RECIPIENT_EMAIL` | strip + fallback | Recipient for digest alerts. |
 | `digest_max_items_per_run` | `DIGEST_MAX_ITEMS_PER_RUN` | `int` | no | `100` | `int(...)` | Cap on queued digest items. |
 | `digest_topic_dedupe_enabled` | `DIGEST_TOPIC_DEDUPE_ENABLED` | `bool` | no | `true` | truthy set | Enables topic-level duplicate skips for digest-bound items. |
-| `digest_topic_dedupe_threshold` | `DIGEST_TOPIC_DEDUPE_THRESHOLD` | `float` | no | `0.30` | `float(...)` | Minimum title+abstract+text cosine score for digest-topic duplicate candidates. |
 | `digest_topic_dedupe_lookback_hours` | `DIGEST_TOPIC_DEDUPE_LOOKBACK_HOURS` | `int` | no | fallback to `MAX_ARTICLE_AGE_HOURS` | `int(...)` | Time window for stored digest-topic comparisons. |
 | `abstract_max_chars` | `ABSTRACT_MAX_CHARS` | `int` | no | `420` | `int(...)` | Max abstract length for article summaries. |
 | `max_victim_words` | `MAX_VICTIM_WORDS` | `int` | no | `8` | `int(...)` | Victim extractor candidate/finalization word limit. |
@@ -356,11 +372,6 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 - Object: module logger via `logging.getLogger(__name__)`.
 - Used for source fetch warnings and run completion metrics.
 
-#### `_ensure_utc(value: datetime | None) -> datetime | None`
-
-- Purpose: normalize source timestamps for freshness filtering and sorting.
-- Output: UTC-aware datetime or `None`.
-
 #### `_filter_fresh_articles(articles, max_age_hours) -> list[SourceArticle]`
 
 - Purpose: drop dated source items older than the configured freshness window before body fetch/classification.
@@ -418,6 +429,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 
 - Fields: `processed`, `alerts_sent`, `digest_sent`, `digest_queued`, `skipped`, `errors`.
 - Purpose: immutable run counters returned by `run()`.
+- `add(...)`: returns a new metrics instance with selected counters incremented.
 
 #### `_DigestQueueEntry` (`@dataclass(frozen=True)`)
 
@@ -439,11 +451,16 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 - Fields: `item`, `content`, `canonical_url`, `fingerprint`, `content_hash`, `similarity_document`, `original_index`.
 - Purpose: carries fetched article content and dedupe keys between preparation, current-run dedupe, and survivor processing.
 
+#### `_RecentArticle` (`@dataclass(frozen=True)`)
+
+- Fields: `article_id`, `title`, `abstract`, `text`.
+- Purpose: normalized payload loaded once for stored near-duplicate and digest-topic duplicate checks.
+
 #### `MonitorPipeline`
 
 Constructor:
 
-`__init__(database, fetcher, classifier, victim_extractor, emailer, min_victim_confidence=0.65, incident_dedupe_window_hours=48, near_duplicate_enabled=True, near_duplicate_threshold=0.78, near_duplicate_lookback_hours=None, near_duplicate_max_comparisons=500, suppress_out_of_scope_digest=True, digest_enabled=True, digest_recipient_email=None, digest_max_items_per_run=100, digest_topic_dedupe_enabled=True, digest_topic_dedupe_threshold=0.30, digest_topic_dedupe_lookback_hours=168)`
+`__init__(database, fetcher, classifier, victim_extractor, emailer, min_victim_confidence=0.65, incident_dedupe_window_hours=48, near_duplicate_enabled=True, similarity_dedupe_threshold=0.30, near_duplicate_lookback_hours=None, near_duplicate_max_comparisons=500, suppress_out_of_scope_digest=True, digest_enabled=True, digest_recipient_email=None, digest_max_items_per_run=100, digest_topic_dedupe_enabled=True, digest_topic_dedupe_lookback_hours=168)`
 
 - Purpose: inject all collaborators and policy controls.
 
@@ -478,6 +495,9 @@ Methods:
   - Handles DB duplicate races via `IntegrityError` rollback and skip accounting.
   - Immediate send failures do not increment `errors`; they mark alert row as `failed`.
 
+- `_build_immediate_email(item, content, classification, victim) -> AlertEmail`
+  - Builds the immediate alert subject/body once for persistence and SMTP send.
+
 - `_routing_reason(article_type, attack_type, has_confident_victim, duplicate_incident) -> str`
   - Routing decision helper.
   - Return values: `duplicate_incident`, non-incident article type, `out_of_taxonomy`, `low_victim_confidence`, `qualified_incident`.
@@ -486,13 +506,17 @@ Methods:
   - Finds prior articles with same incident key and compares UTC time delta to configured window.
   - If candidate time is missing but matches exist, returns `True` conservatively.
 
+- `_load_recent_articles(candidate_time, lookback_hours) -> list[_RecentArticle]`
+  - Loads recent stored article text/metadata up to `near_duplicate_max_comparisons`.
+  - Applies the supplied lookback window when candidate time is known.
+
 - `_find_digest_topic_duplicate(title, abstract, text, candidate_time) -> _TopicDuplicateResult | None`
-  - Loads recent stored articles up to `near_duplicate_max_comparisons`.
+  - Uses `_load_recent_articles()` with digest-topic lookback settings.
   - Applies `digest_topic_dedupe_lookback_hours` when candidate time is known.
   - Uses `find_topic_duplicate()` over title + abstract + article-text prefix and requires shared salient title terms.
 
 - `_find_near_duplicate(title, abstract, text, candidate_time) -> _NearDuplicateResult | None`
-  - Loads recent stored articles up to `near_duplicate_max_comparisons`.
+  - Uses `_load_recent_articles()` with near-duplicate lookback settings.
   - Applies `near_duplicate_lookback_hours` when candidate time is known.
   - Uses `build_similarity_document()` and `find_near_duplicate()` to find the best match.
 
@@ -502,9 +526,6 @@ Methods:
 
 - `_published_date(published_at) -> str`
   - Converts datetime to UTC ISO8601 string; returns `unknown` when absent.
-
-- `_ensure_utc(value) -> datetime | None`
-  - Normalizes naive datetimes to UTC or converts aware datetimes to UTC.
 
 ## 6.4 `app/alerts/emailer.py`
 
@@ -1143,7 +1164,7 @@ Build behavior:
 - Expand taxonomy by adding `ATTACK_PATTERNS` entries and adjusting classifier thresholds/rules.
 - Tune false-positive suppression by adding `OUT_OF_SCOPE_PATTERNS` entries or refining `CYBER_SCOPE_PATTERNS`.
 - Improve extraction robustness by tuning `VICTIM_PATTERNS`, noise filters, and confidence heuristics.
-- Tune duplicate sensitivity through `NEAR_DUPLICATE_THRESHOLD`, lookback, and comparison-count settings.
+- Tune duplicate sensitivity through `SIMILARITY_DEDUPE_THRESHOLD`, lookback, and comparison-count settings.
 - Introduce migration tooling (for example Alembic) to replace ad-hoc schema evolution in `initialize_schema`.
 - Add channel integrations by extending `Emailer` abstraction and `MonitorPipeline` alert dispatch branch.
 

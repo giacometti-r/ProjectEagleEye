@@ -16,16 +16,9 @@ from app.sources.base import SourceArticle
 from app.sources.gdelt import GdeltSource
 from app.sources.google_news import GoogleNewsRssSource
 from app.sources.rss import RssSource
+from app.time_utils import ensure_utc
 
 logger = logging.getLogger(__name__)
-
-
-def _ensure_utc(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
 
 
 def _filter_fresh_articles(articles: list[SourceArticle], max_age_hours: int) -> list[SourceArticle]:
@@ -36,7 +29,7 @@ def _filter_fresh_articles(articles: list[SourceArticle], max_age_hours: int) ->
     fresh_articles = [
         article
         for article in articles
-        if (published_at := _ensure_utc(article.published_at)) is None or published_at >= cutoff
+        if (published_at := ensure_utc(article.published_at)) is None or published_at >= cutoff
     ]
     dropped = len(articles) - len(fresh_articles)
     if dropped:
@@ -89,7 +82,7 @@ def gather_articles(settings: object) -> list[SourceArticle]:
 
     # Enforce newest-first processing even when upstream feed/API ordering differs.
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    all_articles.sort(key=lambda x: _ensure_utc(x.published_at) or epoch, reverse=True)
+    all_articles.sort(key=lambda x: ensure_utc(x.published_at) or epoch, reverse=True)
 
     return all_articles
 
@@ -122,7 +115,7 @@ def main() -> int:
         min_victim_confidence=settings.min_victim_confidence,
         incident_dedupe_window_hours=settings.incident_dedupe_window_hours,
         near_duplicate_enabled=settings.near_duplicate_enabled,
-        near_duplicate_threshold=settings.near_duplicate_threshold,
+        similarity_dedupe_threshold=settings.similarity_dedupe_threshold,
         near_duplicate_lookback_hours=settings.near_duplicate_lookback_hours,
         near_duplicate_max_comparisons=settings.near_duplicate_max_comparisons,
         suppress_out_of_scope_digest=settings.suppress_out_of_scope_digest,
@@ -130,7 +123,6 @@ def main() -> int:
         digest_recipient_email=settings.digest_recipient_email,
         digest_max_items_per_run=settings.digest_max_items_per_run,
         digest_topic_dedupe_enabled=settings.digest_topic_dedupe_enabled,
-        digest_topic_dedupe_threshold=settings.digest_topic_dedupe_threshold,
         digest_topic_dedupe_lookback_hours=settings.digest_topic_dedupe_lookback_hours,
     )
 

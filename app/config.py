@@ -41,7 +41,7 @@ class Settings:
     min_victim_confidence: float
     incident_dedupe_window_hours: int
     near_duplicate_enabled: bool
-    near_duplicate_threshold: float
+    similarity_dedupe_threshold: float
     near_duplicate_lookback_hours: int | None
     near_duplicate_max_comparisons: int
     suppress_out_of_scope_digest: bool
@@ -49,7 +49,6 @@ class Settings:
     digest_recipient_email: str
     digest_max_items_per_run: int
     digest_topic_dedupe_enabled: bool
-    digest_topic_dedupe_threshold: float
     digest_topic_dedupe_lookback_hours: int
     abstract_max_chars: int
     max_victim_words: int
@@ -64,6 +63,26 @@ def _require(name: str) -> str:
     if not value:
         raise ConfigError(f"Missing required env var: {name}")
     return value
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes"}
+
+
+def _parse_int_env(name: str, default: int) -> int:
+    return int(os.getenv(name, str(default)).strip())
+
+
+def _parse_optional_int_env(name: str) -> int | None:
+    value = os.getenv(name, "").strip()
+    return int(value) if value else None
+
+
+def _parse_float_env(name: str, default: float) -> float:
+    return float(os.getenv(name, str(default)).strip())
 
 
 def _parse_list_env(name: str, default: List[str]) -> List[str]:
@@ -85,48 +104,41 @@ def _parse_list_env(name: str, default: List[str]) -> List[str]:
 
 
 def load_settings() -> Settings:
+    recipient_email = _require("RECIPIENT_EMAIL")
+    max_article_age_hours = _parse_int_env("MAX_ARTICLE_AGE_HOURS", 168)
+    digest_recipient_email = os.getenv("DIGEST_RECIPIENT_EMAIL", recipient_email).strip() or recipient_email
+
     return Settings(
         smtp_host=_require("SMTP_HOST"),
-        smtp_port=int(os.getenv("SMTP_PORT", "587")),
+        smtp_port=_parse_int_env("SMTP_PORT", 587),
         smtp_username=_require("SMTP_USERNAME"),
         smtp_password=_require("SMTP_PASSWORD"),
         sender_email=_require("SENDER_EMAIL"),
-        recipient_email=_require("RECIPIENT_EMAIL"),
+        recipient_email=recipient_email,
         database_url=_require("DATABASE_URL"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
-        request_timeout_seconds=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "15")),
-        max_articles_per_source=int(os.getenv("MAX_ARTICLES_PER_SOURCE", "50")),
-        max_article_age_hours=int(os.getenv("MAX_ARTICLE_AGE_HOURS", "168")),
-        enable_gdelt=os.getenv("ENABLE_GDELT", "true").strip().lower() in {"1", "true", "yes"},
-        gdelt_query_window_minutes=int(os.getenv("GDELT_QUERY_WINDOW_MINUTES", "180")),
+        request_timeout_seconds=_parse_int_env("REQUEST_TIMEOUT_SECONDS", 15),
+        max_articles_per_source=_parse_int_env("MAX_ARTICLES_PER_SOURCE", 50),
+        max_article_age_hours=max_article_age_hours,
+        enable_gdelt=_parse_bool_env("ENABLE_GDELT", True),
+        gdelt_query_window_minutes=_parse_int_env("GDELT_QUERY_WINDOW_MINUTES", 180),
         rss_feeds=_parse_list_env("RSS_FEEDS", DEFAULT_RSS_FEEDS),
         google_news_queries=_parse_list_env("GOOGLE_NEWS_QUERIES", DEFAULT_GOOGLE_NEWS_QUERIES),
-        min_victim_confidence=float(os.getenv("MIN_VICTIM_CONFIDENCE", "0.65")),
-        incident_dedupe_window_hours=int(os.getenv("INCIDENT_DEDUPE_WINDOW_HOURS", "48")),
-        near_duplicate_enabled=os.getenv("NEAR_DUPLICATE_ENABLED", "true").strip().lower()
-        in {"1", "true", "yes"},
-        near_duplicate_threshold=float(os.getenv("NEAR_DUPLICATE_THRESHOLD", "0.78")),
-        near_duplicate_lookback_hours=(
-            int(os.getenv("NEAR_DUPLICATE_LOOKBACK_HOURS", "").strip())
-            if os.getenv("NEAR_DUPLICATE_LOOKBACK_HOURS", "").strip()
-            else None
+        min_victim_confidence=_parse_float_env("MIN_VICTIM_CONFIDENCE", 0.65),
+        incident_dedupe_window_hours=_parse_int_env("INCIDENT_DEDUPE_WINDOW_HOURS", 48),
+        near_duplicate_enabled=_parse_bool_env("NEAR_DUPLICATE_ENABLED", True),
+        similarity_dedupe_threshold=_parse_float_env("SIMILARITY_DEDUPE_THRESHOLD", 0.30),
+        near_duplicate_lookback_hours=_parse_optional_int_env("NEAR_DUPLICATE_LOOKBACK_HOURS"),
+        near_duplicate_max_comparisons=_parse_int_env("NEAR_DUPLICATE_MAX_COMPARISONS", 500),
+        suppress_out_of_scope_digest=_parse_bool_env("SUPPRESS_OUT_OF_SCOPE_DIGEST", True),
+        digest_enabled=_parse_bool_env("DIGEST_ENABLED", True),
+        digest_recipient_email=digest_recipient_email,
+        digest_max_items_per_run=_parse_int_env("DIGEST_MAX_ITEMS_PER_RUN", 100),
+        digest_topic_dedupe_enabled=_parse_bool_env("DIGEST_TOPIC_DEDUPE_ENABLED", True),
+        digest_topic_dedupe_lookback_hours=_parse_int_env(
+            "DIGEST_TOPIC_DEDUPE_LOOKBACK_HOURS",
+            max_article_age_hours,
         ),
-        near_duplicate_max_comparisons=int(os.getenv("NEAR_DUPLICATE_MAX_COMPARISONS", "500")),
-        suppress_out_of_scope_digest=os.getenv("SUPPRESS_OUT_OF_SCOPE_DIGEST", "true").strip().lower()
-        in {"1", "true", "yes"},
-        digest_enabled=os.getenv("DIGEST_ENABLED", "true").strip().lower() in {"1", "true", "yes"},
-        digest_recipient_email=os.getenv("DIGEST_RECIPIENT_EMAIL", os.getenv("RECIPIENT_EMAIL", "")).strip()
-        or _require("RECIPIENT_EMAIL"),
-        digest_max_items_per_run=int(os.getenv("DIGEST_MAX_ITEMS_PER_RUN", "100")),
-        digest_topic_dedupe_enabled=os.getenv("DIGEST_TOPIC_DEDUPE_ENABLED", "true").strip().lower()
-        in {"1", "true", "yes"},
-        digest_topic_dedupe_threshold=float(os.getenv("DIGEST_TOPIC_DEDUPE_THRESHOLD", "0.30")),
-        digest_topic_dedupe_lookback_hours=int(
-            os.getenv(
-                "DIGEST_TOPIC_DEDUPE_LOOKBACK_HOURS",
-                os.getenv("MAX_ARTICLE_AGE_HOURS", "168"),
-            )
-        ),
-        abstract_max_chars=int(os.getenv("ABSTRACT_MAX_CHARS", "420")),
-        max_victim_words=int(os.getenv("MAX_VICTIM_WORDS", "8")),
+        abstract_max_chars=_parse_int_env("ABSTRACT_MAX_CHARS", 420),
+        max_victim_words=_parse_int_env("MAX_VICTIM_WORDS", 8),
     )

@@ -46,7 +46,7 @@ def test_similarity_matches_exact_repeated_title() -> None:
         )
     ]
 
-    match = find_near_duplicate(candidate, existing, threshold=0.78)
+    match = find_near_duplicate(candidate, existing, threshold=0.30)
     assert match is not None
     assert match.index == 0
 
@@ -65,7 +65,7 @@ def test_similarity_matches_source_suffix_title_variant() -> None:
         )
     ]
 
-    assert find_near_duplicate(candidate, existing, threshold=0.78) is not None
+    assert find_near_duplicate(candidate, existing, threshold=0.30) is not None
 
 
 def test_similarity_does_not_match_unrelated_advisories() -> None:
@@ -82,7 +82,7 @@ def test_similarity_does_not_match_unrelated_advisories() -> None:
         )
     ]
 
-    assert find_near_duplicate(candidate, existing, threshold=0.78) is None
+    assert find_near_duplicate(candidate, existing, threshold=0.30) is None
 
 
 def test_topic_duplicate_matches_digest_rewrite_examples() -> None:
