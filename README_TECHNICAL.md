@@ -125,8 +125,9 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
    - One cached recent-article load for stored near-duplicate checks, with precomputed similarity/topic documents reused during the run.
 2. Current-run batch dedupe across prepared candidates:
    - Groups exact matches by canonical URL, content hash, and fingerprint.
-   - Groups near-duplicates with TF-IDF cosine similarity when enabled.
-   - Keeps the newest `published_at`; ties and missing timestamps keep the earlier input order.
+   - Groups near-duplicates with TF-IDF cosine similarity when enabled and the current-run threshold is met.
+   - Low-score near-duplicates must also share salient title terms or named entities.
+   - Keeps the highest-priority source; ties keep the newest `published_at`, then the earlier input order.
 3. Survivor processing:
    - Classification (`AttackClassifier.classify`), including cyber-scope gating.
    - Victim extraction (`VictimExtractor.extract`) with conservative noise rejection.
@@ -154,11 +155,11 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 2. Stored canonical URL dedupe (`articles.canonical_url` unique).
 3. Stored exact content hash dedupe (`articles.content_hash` lookup).
 4. Stored fingerprint dedupe (`article_fingerprints.fingerprint` unique).
-5. Stored near-duplicate dedupe (`TfidfVectorizer` + cosine similarity over cached recent stored articles).
+5. Stored near-duplicate dedupe (`TfidfVectorizer` + cosine similarity over cached recent stored articles using the stored-near threshold).
 6. Current-run exact dedupe by canonical URL, content hash, and fingerprint.
-7. Current-run near-duplicate dedupe using the same similarity threshold/window settings.
+7. Current-run near-duplicate dedupe using the current-run threshold/window settings plus the low-score guard.
 8. Incident-window dedupe (`articles.incident_key` + temporal comparison).
-9. Digest-topic dedupe (`TfidfVectorizer` over title + abstract + article-text prefix plus salient title-overlap guard).
+9. Digest-topic dedupe (`TfidfVectorizer` over title + abstract + article-text prefix using the digest-topic threshold plus salient title-overlap guard).
 
 ### 3.6 Scheduling and Operations
 
@@ -262,7 +263,8 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 | `min_victim_confidence` | `MIN_VICTIM_CONFIDENCE` | `float` | no | `0.65` | `float(...)` | Threshold for immediate-channel eligibility. |
 | `incident_dedupe_window_hours` | `INCIDENT_DEDUPE_WINDOW_HOURS` | `int` | no | `48` | `int(...)` | Time window for incident-key suppression. |
 | `near_duplicate_enabled` | `NEAR_DUPLICATE_ENABLED` | `bool` | no | `true` | truthy set | Enables TF-IDF cosine near-duplicate skips. |
-| `similarity_dedupe_threshold` | `SIMILARITY_DEDUPE_THRESHOLD` | `float` | no | `0.30` | `float(...)` | Minimum TF-IDF cosine score shared by alert near-duplicate, current-run near-duplicate, and digest-topic duplicate checks. |
+| `stored_near_duplicate_threshold` | `STORED_NEAR_DUPLICATE_THRESHOLD` | `float` | no | `0.38` | `float(...)` | Minimum TF-IDF cosine score for stored recent-article near-duplicate checks. |
+| `current_run_near_duplicate_threshold` | `CURRENT_RUN_NEAR_DUPLICATE_THRESHOLD` | `float` | no | `0.34` | `float(...)` | Minimum TF-IDF cosine score for current-run near-duplicate grouping. |
 | `near_duplicate_lookback_hours` | `NEAR_DUPLICATE_LOOKBACK_HOURS` | `int \| None` | no | fallback to incident window | optional `int(...)` | Time window for candidate comparison. |
 | `near_duplicate_max_comparisons` | `NEAR_DUPLICATE_MAX_COMPARISONS` | `int` | no | `500` | `int(...)` | Max recent articles loaded for similarity comparison. |
 | `suppress_out_of_scope_digest` | `SUPPRESS_OUT_OF_SCOPE_DIGEST` | `bool` | no | `true` | truthy set | Stores but does not send out-of-scope digest items. |
@@ -270,6 +272,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 | `digest_recipient_email` | `DIGEST_RECIPIENT_EMAIL` | `str` | conditional | fallback to `RECIPIENT_EMAIL` | strip + fallback | Recipient for digest alerts. |
 | `digest_max_items_per_run` | `DIGEST_MAX_ITEMS_PER_RUN` | `int` | no | `100` | `int(...)` | Cap on queued digest items. |
 | `digest_topic_dedupe_enabled` | `DIGEST_TOPIC_DEDUPE_ENABLED` | `bool` | no | `true` | truthy set | Enables topic-level duplicate skips for digest-bound items. |
+| `digest_topic_dedupe_threshold` | `DIGEST_TOPIC_DEDUPE_THRESHOLD` | `float` | no | `0.40` | `float(...)` | Minimum TF-IDF cosine score for digest-topic duplicate checks. |
 | `digest_topic_dedupe_lookback_hours` | `DIGEST_TOPIC_DEDUPE_LOOKBACK_HOURS` | `int` | no | fallback to `MAX_ARTICLE_AGE_HOURS` | `int(...)` | Time window for stored digest-topic comparisons. |
 | `abstract_max_chars` | `ABSTRACT_MAX_CHARS` | `int` | no | `420` | `int(...)` | Max abstract length for article summaries. |
 | `max_victim_words` | `MAX_VICTIM_WORDS` | `int` | no | `8` | `int(...)` | Victim extractor candidate/finalization word limit. |
@@ -430,12 +433,39 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 
 - Module logger for exception/error diagnostics.
 
+#### Constants and Pattern Objects
+
+- `LOW_SCORE_DUPLICATE_GUARD_THRESHOLD`: score boundary below which near-duplicate matches need extra title/entity evidence.
+- `AGGREGATOR_SOURCE_NAMES`: low-priority source names for survivor selection.
+- `PRIMARY_SOURCE_DOMAINS`: high-priority source domains that should win duplicate survivor selection.
+- `REWRITE_SOURCE_DOMAINS`: low-priority rewrite/aggregator domains.
+- `KNOWN_ENTITY_TERMS`: entity tokens recognized even when lowercased by source titles.
+- `NAMED_ENTITY_TOKEN_RE`: title token pattern used for lightweight named-entity overlap.
+
 #### `_clip(value: str, max_len: int) -> str`
 
 - Purpose: hard truncate string to DB-safe length.
 - Input: raw `value`, `max_len`.
 - Output: original if short else prefix slice.
 - Consumers: field preparation before ORM insert.
+
+#### `_normalized_host(url: str) -> str`
+
+- Purpose: normalize URL hostnames for source-priority domain matching.
+- Behavior: lowercases host and strips leading `www.`.
+
+#### `_host_matches(host: str, domains: set[str]) -> bool`
+
+- Purpose: match exact domains and subdomains against priority domain sets.
+
+#### `_named_entity_terms(title: str) -> set[str]`
+
+- Purpose: extract lightweight named-entity title tokens for low-score near-duplicate guard evidence.
+- Behavior: ignores trailing source suffixes and short generic tokens.
+
+#### `_shared_named_entity_terms(left_title, right_title) -> tuple[str, ...]`
+
+- Purpose: return shared named-entity evidence between two titles.
 
 #### `PipelineMetrics` (`@dataclass(frozen=True)`)
 
@@ -450,7 +480,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 
 #### `_TopicDuplicateResult` (`@dataclass(frozen=True)`)
 
-- Fields: `article_id`, `score`, `title`, `shared_title_terms`.
+- Fields: `article_id`, `score`, `title`, `url`, `shared_title_terms`.
 - Purpose: carries the best digest-topic duplicate match for logging and skip decisions.
 
 #### `_FetchedCandidate` (`@dataclass(frozen=True)`)
@@ -465,7 +495,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 
 #### `_RecentArticle` (`@dataclass(frozen=True)`)
 
-- Fields: `article_id`, `title`, `published_at`, `created_at`, `similarity_document`, `topic_document`.
+- Fields: `article_id`, `title`, `url`, `published_at`, `created_at`, `similarity_document`, `topic_document`.
 - Purpose: normalized payload loaded once per run for stored near-duplicate and digest-topic duplicate checks.
 
 #### `_RunDedupeContext` (`@dataclass`)
@@ -478,7 +508,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 
 Constructor:
 
-`__init__(database, fetcher, classifier, victim_extractor, emailer, min_victim_confidence=0.65, incident_dedupe_window_hours=48, near_duplicate_enabled=True, similarity_dedupe_threshold=0.30, near_duplicate_lookback_hours=None, near_duplicate_max_comparisons=500, suppress_out_of_scope_digest=True, digest_enabled=True, digest_recipient_email=None, digest_max_items_per_run=100, digest_topic_dedupe_enabled=True, digest_topic_dedupe_lookback_hours=168)`
+`__init__(database, fetcher, classifier, victim_extractor, emailer, min_victim_confidence=0.65, incident_dedupe_window_hours=48, near_duplicate_enabled=True, stored_near_duplicate_threshold=0.38, current_run_near_duplicate_threshold=0.34, near_duplicate_lookback_hours=None, near_duplicate_max_comparisons=500, suppress_out_of_scope_digest=True, digest_enabled=True, digest_recipient_email=None, digest_max_items_per_run=100, digest_topic_dedupe_enabled=True, digest_topic_dedupe_threshold=0.40, digest_topic_dedupe_lookback_hours=168)`
 
 - Purpose: inject all collaborators and policy controls.
 
@@ -502,15 +532,24 @@ Methods:
   - Applies batched stored content-hash and fingerprint duplicate checks.
 
 - `_filter_stored_near_duplicates(candidates, context) -> tuple[list[_FetchedCandidate], int]`
-  - Applies batched TF-IDF candidate-vs-recent comparisons using cached recent documents and per-candidate lookback windows.
+  - Applies batched TF-IDF candidate-vs-recent comparisons using cached recent documents, `stored_near_duplicate_threshold`, per-candidate lookback windows, and the low-score guard.
 
 - `_dedupe_current_run_candidates(candidates) -> tuple[list[_FetchedCandidate], int]`
   - Groups prepared candidates by exact dedupe keys and optional near-duplicate similarity.
-  - Keeps the newest `published_at`; missing timestamps compare older than real timestamps, with input order as tie-breaker.
+  - Uses `current_run_near_duplicate_threshold` and the low-score guard for current-run near-duplicate grouping.
+  - Keeps the highest source-priority survivor; missing timestamps compare older than real timestamps, with input order as final tie-breaker.
   - Returns survivor candidates in original input order plus the duplicate loser count.
 
-- `_candidate_survivor_key(candidate) -> tuple[datetime, int]`
-  - Builds the current-run survivor priority key from UTC publication time and inverse input index.
+- `_candidate_survivor_key(candidate) -> tuple[int, datetime, int]`
+  - Builds the current-run survivor priority key from source priority, UTC publication time, and inverse input index.
+
+- `_source_priority(candidate) -> int`
+  - Scores source/domain quality for current-run duplicate survivor selection.
+  - Primary domains beat neutral sources, neutral sources beat aggregators, and known rewrite domains are lowest priority.
+
+- `_passes_low_score_duplicate_guard(score, left_title, right_title) -> bool`
+  - Allows scores at or above `LOW_SCORE_DUPLICATE_GUARD_THRESHOLD`.
+  - For lower scores, requires shared salient title terms or shared named-entity terms.
 
 - `_within_near_duplicate_window(left, right) -> bool`
   - Applies `near_duplicate_lookback_hours` to current-run near-duplicate pairs when both timestamps are known.
@@ -551,7 +590,7 @@ Methods:
 - `_find_digest_topic_duplicate(candidate, candidate_time, context) -> _TopicDuplicateResult | None`
   - Uses cached recent articles with digest-topic lookback settings.
   - Applies `digest_topic_dedupe_lookback_hours` when candidate time is known.
-  - Uses precomputed topic documents and requires shared salient title terms.
+  - Uses precomputed topic documents, `digest_topic_dedupe_threshold`, and requires shared salient title terms.
 
 - `_flush_digest_queue(digest_queue, metrics) -> PipelineMetrics`
   - Sends one digest email when enabled and queue non-empty.
@@ -999,7 +1038,7 @@ This section maps each test symbol to the production behavior it validates.
 - `test_similarity_matches_source_suffix_title_variant()`
   - Confirms source-suffix title variants are detected as near-duplicates.
 - `test_similarity_does_not_match_unrelated_advisories()`
-  - Confirms unrelated advisory headlines remain distinct at the default threshold.
+  - Confirms unrelated advisory headlines remain distinct at the configured threshold.
 - `test_topic_duplicate_matches_digest_rewrite_examples()`
   - Confirms digest-topic matching catches representative Meta/NSO, CISA, tax phishing, and UNC3753 rewrites.
 - `test_topic_duplicate_requires_salient_title_overlap()`
@@ -1116,13 +1155,23 @@ This section maps each test symbol to the production behavior it validates.
 - `test_pipeline_sends_once_for_canonical_duplicates()`
   - Contract: canonical duplicates produce one immediate send, one stored immediate alert marked `sent`.
 - `test_pipeline_current_run_canonical_duplicate_keeps_newest()`
-  - Contract: current-run canonical duplicates keep the newest published article and store/send only that survivor.
+  - Contract: current-run canonical duplicates keep the newest published article when source priority ties and store/send only that survivor.
 - `test_pipeline_current_run_content_hash_duplicate_keeps_newest()`
-  - Contract: current-run exact content duplicates keep the newest published article.
+  - Contract: current-run exact content duplicates keep the newest published article when source priority ties.
 - `test_pipeline_current_run_fingerprint_duplicate_keeps_newest()`
-  - Contract: current-run fingerprint duplicates keep the newest published article even when content hashes differ.
+  - Contract: current-run fingerprint duplicates keep the newest published article when source priority ties even when content hashes differ.
 - `test_pipeline_current_run_near_duplicate_keeps_newest_when_enabled()`
-  - Contract: current-run TF-IDF near-duplicates keep the newest published article when near-duplicate detection is enabled.
+  - Contract: current-run TF-IDF near-duplicates keep the newest published article when near-duplicate detection is enabled and source priority ties.
+- `test_pipeline_current_run_duplicate_prefers_primary_source_over_newer_rewrite()`
+  - Contract: current-run duplicate survivor selection prefers primary source domains over newer rewrite domains and logs duplicate reason/title/score context.
+- `test_pipeline_current_run_threshold_controls_current_matches()`
+  - Contract: `current_run_near_duplicate_threshold` only controls current-run near-duplicate grouping.
+- `test_pipeline_low_score_near_duplicate_skips_with_salient_title_overlap()`
+  - Contract: low-score near-duplicate matches can still skip when titles share salient terms.
+- `test_pipeline_low_score_near_duplicate_survives_without_title_or_entity_overlap()`
+  - Contract: low-score near-duplicate matches survive when they lack title/entity evidence.
+- `test_pipeline_high_score_near_duplicate_skips_without_title_overlap()`
+  - Contract: high-score near-duplicate matches skip even without title/entity overlap.
 - `test_pipeline_current_run_near_duplicates_both_survive_when_disabled()`
   - Contract: current-run near-duplicates both persist when near-duplicate detection is disabled.
 - `test_pipeline_current_run_duplicate_loser_is_not_persisted_or_in_digest()`
@@ -1133,6 +1182,10 @@ This section maps each test symbol to the production behavior it validates.
   - Contract: second same-incident story within window is skipped without an `Article`/`Alert` row.
 - `test_pipeline_skips_digest_topic_duplicate()`
   - Contract: non-immediate same-topic digest rewrites are skipped before persistence.
+- `test_pipeline_skips_digest_topic_duplicate_using_article_text()`
+  - Contract: digest-topic matching can use article text when titles/abstracts are weak.
+- `test_pipeline_digest_topic_threshold_controls_digest_matches()`
+  - Contract: `digest_topic_dedupe_threshold` only controls digest-topic duplicate skips.
 - `test_pipeline_keeps_digest_items_with_only_generic_title_overlap()`
   - Contract: digest topic dedupe does not suppress unrelated items sharing only generic title terms.
 - `test_pipeline_routes_out_of_taxonomy_to_digest()`
@@ -1145,6 +1198,8 @@ This section maps each test symbol to the production behavior it validates.
   - Contract: TF-IDF near-duplicates are skipped before immediate or digest routing.
 - `test_pipeline_skips_stored_near_duplicate_from_cached_recent_articles()`
   - Contract: a second run skips a stored near-duplicate using the run-level recent-article cache.
+- `test_pipeline_stored_near_threshold_controls_stored_matches()`
+  - Contract: `stored_near_duplicate_threshold` only controls stored recent-article near-duplicate skips.
 - `test_pipeline_batches_stored_exact_key_skips()`
   - Contract: stored canonical, content-hash, and fingerprint duplicates are skipped through batched checks; canonical duplicates are not fetched.
 - `test_pipeline_suppresses_out_of_scope_digest_item()`
@@ -1230,7 +1285,7 @@ Build behavior:
 - Expand taxonomy by adding `ATTACK_PATTERNS` entries and adjusting classifier thresholds/rules.
 - Tune false-positive suppression by adding `OUT_OF_SCOPE_PATTERNS` entries or refining `CYBER_SCOPE_PATTERNS`.
 - Improve extraction robustness by tuning `VICTIM_PATTERNS`, noise filters, and confidence heuristics.
-- Tune duplicate sensitivity through `SIMILARITY_DEDUPE_THRESHOLD`, lookback, and comparison-count settings.
+- Tune duplicate sensitivity through the stored/current-run/digest-topic threshold settings, lookback windows, source-priority domain sets, and comparison-count settings.
 - Introduce migration tooling (for example Alembic) to replace ad-hoc schema evolution in `initialize_schema`.
 - Add channel integrations by extending `Emailer` abstraction and `MonitorPipeline` alert dispatch branch.
 

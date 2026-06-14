@@ -124,7 +124,8 @@ def main() -> int:
         min_victim_confidence=settings.min_victim_confidence,
         incident_dedupe_window_hours=settings.incident_dedupe_window_hours,
         near_duplicate_enabled=settings.near_duplicate_enabled,
-        similarity_dedupe_threshold=settings.similarity_dedupe_threshold,
+        stored_near_duplicate_threshold=settings.stored_near_duplicate_threshold,
+        current_run_near_duplicate_threshold=settings.current_run_near_duplicate_threshold,
         near_duplicate_lookback_hours=settings.near_duplicate_lookback_hours,
         near_duplicate_max_comparisons=settings.near_duplicate_max_comparisons,
         suppress_out_of_scope_digest=settings.suppress_out_of_scope_digest,
@@ -132,6 +133,7 @@ def main() -> int:
         digest_recipient_email=settings.digest_recipient_email,
         digest_max_items_per_run=settings.digest_max_items_per_run,
         digest_topic_dedupe_enabled=settings.digest_topic_dedupe_enabled,
+        digest_topic_dedupe_threshold=settings.digest_topic_dedupe_threshold,
         digest_topic_dedupe_lookback_hours=settings.digest_topic_dedupe_lookback_hours,
     )
 

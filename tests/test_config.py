@@ -12,25 +12,27 @@ def _set_required_env(monkeypatch) -> None:
     monkeypatch.setenv("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 
 
-def test_similarity_dedupe_threshold_uses_new_env_var(monkeypatch) -> None:
+def test_dedupe_thresholds_use_dedicated_env_vars(monkeypatch) -> None:
     _set_required_env(monkeypatch)
-    monkeypatch.setenv("SIMILARITY_DEDUPE_THRESHOLD", "0.42")
-    monkeypatch.setenv("NEAR_DUPLICATE_THRESHOLD", "0.99")
-    monkeypatch.setenv("DIGEST_TOPIC_DEDUPE_THRESHOLD", "0.99")
+    monkeypatch.setenv("STORED_NEAR_DUPLICATE_THRESHOLD", "0.41")
+    monkeypatch.setenv("CURRENT_RUN_NEAR_DUPLICATE_THRESHOLD", "0.36")
+    monkeypatch.setenv("DIGEST_TOPIC_DEDUPE_THRESHOLD", "0.47")
 
     settings = load_settings()
 
-    assert settings.similarity_dedupe_threshold == 0.42
-    assert not hasattr(settings, "near_duplicate_threshold")
-    assert not hasattr(settings, "digest_topic_dedupe_threshold")
+    assert settings.stored_near_duplicate_threshold == 0.41
+    assert settings.current_run_near_duplicate_threshold == 0.36
+    assert settings.digest_topic_dedupe_threshold == 0.47
+    assert not hasattr(settings, "similarity_dedupe_threshold")
 
 
-def test_removed_threshold_env_vars_are_ignored(monkeypatch) -> None:
+def test_dedupe_threshold_defaults_ignore_removed_shared_env_var(monkeypatch) -> None:
     _set_required_env(monkeypatch)
-    monkeypatch.delenv("SIMILARITY_DEDUPE_THRESHOLD", raising=False)
-    monkeypatch.setenv("NEAR_DUPLICATE_THRESHOLD", "0.99")
-    monkeypatch.setenv("DIGEST_TOPIC_DEDUPE_THRESHOLD", "0.99")
+    monkeypatch.setenv("SIMILARITY_DEDUPE_THRESHOLD", "0.99")
 
     settings = load_settings()
 
-    assert settings.similarity_dedupe_threshold == 0.30
+    assert settings.stored_near_duplicate_threshold == 0.38
+    assert settings.current_run_near_duplicate_threshold == 0.34
+    assert settings.digest_topic_dedupe_threshold == 0.40
+    assert not hasattr(settings, "similarity_dedupe_threshold")

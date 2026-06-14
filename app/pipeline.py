@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -19,6 +21,7 @@ from app.dedup.deduplicator import (
     find_near_duplicate_candidates,
     find_near_duplicate_pairs,
     find_topic_duplicate_from_documents,
+    shared_salient_title_terms,
 )
 from app.detection.attack_classifier import AttackClassifier
 from app.detection.victim_extractor import VictimExtractor
@@ -29,11 +32,72 @@ from app.time_utils import ensure_utc
 
 logger = logging.getLogger(__name__)
 
+LOW_SCORE_DUPLICATE_GUARD_THRESHOLD = 0.35
+AGGREGATOR_SOURCE_NAMES = {"gdelt", "google news"}
+PRIMARY_SOURCE_DOMAINS = {
+    "bleepingcomputer.com",
+    "cisa.gov",
+    "darkreading.com",
+    "google.com",
+    "googleblog.com",
+    "krebsonsecurity.com",
+    "meta.com",
+    "microsoft.com",
+    "securityweek.com",
+    "thehackernews.com",
+    "therecord.media",
+}
+REWRITE_SOURCE_DOMAINS = {
+    "benzinga.com",
+    "itpro.com",
+    "mexc.com",
+    "newsbytesapp.com",
+}
+KNOWN_ENTITY_TERMS = {
+    "acme",
+    "cisa",
+    "deepseek",
+    "google",
+    "meta",
+    "microsoft",
+    "nso",
+    "openai",
+    "whatsapp",
+}
+NAMED_ENTITY_TOKEN_RE = re.compile(r"\b[A-Z][A-Za-z0-9&.-]{2,}\b|\b[A-Z]{2,}\b")
+
 
 def _clip(value: str, max_len: int) -> str:
     if len(value) <= max_len:
         return value
     return value[:max_len]
+
+
+def _normalized_host(url: str) -> str:
+    host = urlparse(url).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _host_matches(host: str, domains: set[str]) -> bool:
+    return any(host == domain or host.endswith(f".{domain}") for domain in domains)
+
+
+def _named_entity_terms(title: str) -> set[str]:
+    title_without_source = title.rsplit(" - ", 1)[0]
+    terms = set()
+    for token in NAMED_ENTITY_TOKEN_RE.findall(title_without_source):
+        normalized = token.strip(".,:;!?()[]{}").lower()
+        if len(normalized) <= 2:
+            continue
+        if token.isupper() or any(char.isupper() for char in token[1:]) or normalized in KNOWN_ENTITY_TERMS:
+            terms.add(normalized)
+    return terms
+
+
+def _shared_named_entity_terms(left_title: str, right_title: str) -> tuple[str, ...]:
+    return tuple(sorted(_named_entity_terms(left_title) & _named_entity_terms(right_title)))
 
 
 @dataclass(frozen=True)
@@ -76,6 +140,7 @@ class _TopicDuplicateResult:
     article_id: int
     score: float
     title: str
+    url: str
     shared_title_terms: tuple[str, ...]
 
 
@@ -102,6 +167,7 @@ class _PreparedInput:
 class _RecentArticle:
     article_id: int
     title: str
+    url: str
     published_at: datetime | None
     created_at: datetime | None
     similarity_document: str
@@ -120,7 +186,15 @@ class _RunDedupeContext:
     def similarity_documents(self) -> list[str]:
         return [article.similarity_document for article in self.recent_articles]
 
-    def add_recent_article(self, article_id: int, title: str, abstract: str, text: str, published_at: datetime | None) -> None:
+    def add_recent_article(
+        self,
+        article_id: int,
+        title: str,
+        url: str,
+        abstract: str,
+        text: str,
+        published_at: datetime | None,
+    ) -> None:
         if self.near_duplicate_max_comparisons <= 0:
             return
         self.recent_articles.insert(
@@ -128,6 +202,7 @@ class _RunDedupeContext:
             _RecentArticle(
                 article_id=article_id,
                 title=title,
+                url=url,
                 published_at=published_at,
                 created_at=datetime.now(timezone.utc),
                 similarity_document=build_similarity_document(title, abstract, text),
@@ -148,7 +223,8 @@ class MonitorPipeline:
         min_victim_confidence: float = 0.65,
         incident_dedupe_window_hours: int = 48,
         near_duplicate_enabled: bool = True,
-        similarity_dedupe_threshold: float = 0.30,
+        stored_near_duplicate_threshold: float = 0.38,
+        current_run_near_duplicate_threshold: float = 0.34,
         near_duplicate_lookback_hours: int | None = None,
         near_duplicate_max_comparisons: int = 500,
         suppress_out_of_scope_digest: bool = True,
@@ -156,6 +232,7 @@ class MonitorPipeline:
         digest_recipient_email: str | None = None,
         digest_max_items_per_run: int = 100,
         digest_topic_dedupe_enabled: bool = True,
+        digest_topic_dedupe_threshold: float = 0.40,
         digest_topic_dedupe_lookback_hours: int | None = 168,
     ) -> None:
         self.database = database
@@ -166,7 +243,8 @@ class MonitorPipeline:
         self.min_victim_confidence = min_victim_confidence
         self.incident_dedupe_window_hours = incident_dedupe_window_hours
         self.near_duplicate_enabled = near_duplicate_enabled
-        self.similarity_dedupe_threshold = similarity_dedupe_threshold
+        self.stored_near_duplicate_threshold = stored_near_duplicate_threshold
+        self.current_run_near_duplicate_threshold = current_run_near_duplicate_threshold
         self.near_duplicate_lookback_hours = near_duplicate_lookback_hours or incident_dedupe_window_hours
         self.near_duplicate_max_comparisons = near_duplicate_max_comparisons
         self.suppress_out_of_scope_digest = suppress_out_of_scope_digest
@@ -174,6 +252,7 @@ class MonitorPipeline:
         self.digest_recipient_email = digest_recipient_email or emailer.recipient_email
         self.digest_max_items_per_run = digest_max_items_per_run
         self.digest_topic_dedupe_enabled = digest_topic_dedupe_enabled
+        self.digest_topic_dedupe_threshold = digest_topic_dedupe_threshold
         self.digest_topic_dedupe_lookback_hours = digest_topic_dedupe_lookback_hours
 
     def run(self, articles: list[SourceArticle]) -> PipelineMetrics:
@@ -200,6 +279,11 @@ class MonitorPipeline:
 
         for prepared in prepared_inputs:
             if prepared.canonical_url in context.existing_canonical_urls:
+                logger.info(
+                    "Duplicate detected, skipping reason=canonical_url url=%s title=%s",
+                    prepared.item.url,
+                    prepared.item.title,
+                )
                 metrics = metrics.add(skipped=1)
                 continue
 
@@ -293,15 +377,20 @@ class MonitorPipeline:
             content_hash_article_id = context.content_hash_article_ids.get(candidate.content_hash)
             if content_hash_article_id:
                 logger.info(
-                    "Duplicate content hash detected, skipping url=%s existing_article_id=%s",
+                    "Duplicate detected, skipping reason=content_hash url=%s title=%s existing_article_id=%s",
                     candidate.item.url,
+                    candidate.item.title,
                     content_hash_article_id,
                 )
                 duplicate_count += 1
                 continue
 
             if candidate.fingerprint in context.fingerprint_ids:
-                logger.info("Duplicate fingerprint detected, skipping url=%s", candidate.item.url)
+                logger.info(
+                    "Duplicate detected, skipping reason=fingerprint url=%s title=%s",
+                    candidate.item.url,
+                    candidate.item.title,
+                )
                 duplicate_count += 1
                 continue
 
@@ -356,7 +445,7 @@ class MonitorPipeline:
         matches = find_near_duplicate_candidates(
             [candidate.similarity_document for candidate in candidates],
             context.similarity_documents,
-            threshold=self.similarity_dedupe_threshold,
+            threshold=self.stored_near_duplicate_threshold,
             allowed_existing_indices=allowed_existing_indices,
         )
 
@@ -369,11 +458,24 @@ class MonitorPipeline:
                 continue
 
             matched_article = context.recent_articles[match.index]
+            if not self._passes_low_score_duplicate_guard(
+                match.score,
+                candidate.item.title,
+                matched_article.title,
+            ):
+                survivors.append(candidate)
+                continue
+
             logger.info(
-                "Near duplicate detected, skipping url=%s matched_article_id=%s score=%.3f matched_title=%s",
+                (
+                    "Duplicate detected, skipping reason=near_similarity url=%s title=%s "
+                    "matched_article_id=%s score=%.3f matched_url=%s matched_title=%s"
+                ),
                 candidate.item.url,
+                candidate.item.title,
                 matched_article.article_id,
                 match.score,
+                matched_article.url,
                 matched_article.title,
             )
             duplicate_count += 1
@@ -394,13 +496,23 @@ class MonitorPipeline:
                 index = parents[index]
             return index
 
-        def union(left_index: int, right_index: int) -> None:
+        group_reasons: dict[int, set[str]] = {index: set() for index in range(len(candidates))}
+        group_similarity_scores: dict[int, list[float]] = {index: [] for index in range(len(candidates))}
+
+        def union(left_index: int, right_index: int, reason: str, score: float | None = None) -> None:
             left_root = find(left_index)
             right_root = find(right_index)
+            group_reasons.setdefault(left_root, set()).add(reason)
+            group_reasons.setdefault(right_root, set()).add(reason)
+            if score is not None:
+                group_similarity_scores.setdefault(left_root, []).append(score)
+                group_similarity_scores.setdefault(right_root, []).append(score)
             if left_root != right_root:
                 parents[right_root] = left_root
+                group_reasons[left_root].update(group_reasons.pop(right_root, set()))
+                group_similarity_scores[left_root].extend(group_similarity_scores.pop(right_root, []))
 
-        def union_exact_duplicates(attribute: str) -> None:
+        def union_exact_duplicates(attribute: str, reason: str) -> None:
             seen: dict[str, int] = {}
             for index, candidate in enumerate(candidates):
                 key = getattr(candidate, attribute)
@@ -408,19 +520,23 @@ class MonitorPipeline:
                 if first_index is None:
                     seen[key] = index
                 else:
-                    union(first_index, index)
+                    union(first_index, index, reason)
 
-        union_exact_duplicates("canonical_url")
-        union_exact_duplicates("content_hash")
-        union_exact_duplicates("fingerprint")
+        union_exact_duplicates("canonical_url", "canonical_url")
+        union_exact_duplicates("content_hash", "content_hash")
+        union_exact_duplicates("fingerprint", "fingerprint")
 
         if self.near_duplicate_enabled:
             documents = [candidate.similarity_document for candidate in candidates]
-            for match in find_near_duplicate_pairs(documents, threshold=self.similarity_dedupe_threshold):
+            for match in find_near_duplicate_pairs(documents, threshold=self.current_run_near_duplicate_threshold):
                 left = candidates[match.left_index]
                 right = candidates[match.right_index]
-                if self._within_near_duplicate_window(left, right):
-                    union(match.left_index, match.right_index)
+                if self._within_near_duplicate_window(left, right) and self._passes_low_score_duplicate_guard(
+                    match.score,
+                    left.item.title,
+                    right.item.title,
+                ):
+                    union(match.left_index, match.right_index, "near_similarity", match.score)
 
         groups: dict[int, list[int]] = {}
         for index in range(len(candidates)):
@@ -437,16 +553,26 @@ class MonitorPipeline:
         loser_indices = set(range(len(candidates))) - survivor_indices
         for loser_index in sorted(loser_indices):
             loser = candidates[loser_index]
+            root = find(loser_index)
             survivor = candidates[
                 max(
-                    groups[find(loser_index)],
+                    groups[root],
                     key=lambda index: self._candidate_survivor_key(candidates[index]),
                 )
             ]
+            similarity_scores = group_similarity_scores.get(root, [])
+            similarity_score = max(similarity_scores) if similarity_scores else None
             logger.info(
-                "Current-run duplicate detected, skipping url=%s survivor_url=%s",
+                (
+                    "Current-run duplicate detected, skipping reason=%s url=%s title=%s "
+                    "survivor_url=%s survivor_title=%s similarity_score=%s"
+                ),
+                ",".join(sorted(group_reasons.get(root) or {"unknown"})),
                 loser.item.url,
+                loser.item.title,
                 survivor.item.url,
+                survivor.item.title,
+                f"{similarity_score:.3f}" if similarity_score is not None else "n/a",
             )
 
         survivors = [
@@ -456,9 +582,32 @@ class MonitorPipeline:
         ]
         return survivors, len(loser_indices)
 
-    def _candidate_survivor_key(self, candidate: _FetchedCandidate) -> tuple[datetime, int]:
+    def _candidate_survivor_key(self, candidate: _FetchedCandidate) -> tuple[int, datetime, int]:
         published_at = ensure_utc(candidate.item.published_at)
-        return (published_at or datetime.min.replace(tzinfo=timezone.utc), -candidate.original_index)
+        return (
+            self._source_priority(candidate),
+            published_at or datetime.min.replace(tzinfo=timezone.utc),
+            -candidate.original_index,
+        )
+
+    def _source_priority(self, candidate: _FetchedCandidate) -> int:
+        source_name = candidate.item.source_name.strip().lower()
+        host = _normalized_host(candidate.item.url)
+        if _host_matches(host, PRIMARY_SOURCE_DOMAINS):
+            return 3
+        if _host_matches(host, REWRITE_SOURCE_DOMAINS):
+            return 0
+        if source_name in AGGREGATOR_SOURCE_NAMES:
+            return 1
+        return 2
+
+    def _passes_low_score_duplicate_guard(self, score: float, left_title: str, right_title: str) -> bool:
+        if score >= LOW_SCORE_DUPLICATE_GUARD_THRESHOLD:
+            return True
+        return bool(
+            shared_salient_title_terms(left_title, right_title)
+            or _shared_named_entity_terms(left_title, right_title)
+        )
 
     def _within_near_duplicate_window(self, left: _FetchedCandidate, right: _FetchedCandidate) -> bool:
         left_time = ensure_utc(left.item.published_at)
@@ -518,10 +667,15 @@ class MonitorPipeline:
             )
             if topic_duplicate is not None:
                 logger.info(
-                    "Digest topic duplicate detected, skipping url=%s matched_article_id=%s score=%.3f matched_title=%s shared_title_terms=%s",
+                    (
+                        "Duplicate detected, skipping reason=topic_similarity url=%s title=%s "
+                        "matched_article_id=%s score=%.3f matched_url=%s matched_title=%s shared_title_terms=%s"
+                    ),
                     item.url,
+                    item.title,
                     topic_duplicate.article_id,
                     topic_duplicate.score,
+                    topic_duplicate.url,
                     topic_duplicate.title,
                     ",".join(topic_duplicate.shared_title_terms),
                 )
@@ -536,13 +690,22 @@ class MonitorPipeline:
         with self.database.session() as session:
             existing = session.scalar(select(Article.id).where(Article.canonical_url == canonical_url))
             if existing:
+                logger.info(
+                    "Duplicate detected during insert guard, skipping reason=canonical_url url=%s title=%s",
+                    item.url,
+                    item.title,
+                )
                 return metrics.add(skipped=1)
 
             content_hash_exists = session.scalar(select(Article.id).where(Article.content_hash == content_hash))
             if content_hash_exists:
                 logger.info(
-                    "Duplicate content hash detected during insert guard, skipping url=%s existing_article_id=%s",
+                    (
+                        "Duplicate detected during insert guard, skipping reason=content_hash "
+                        "url=%s title=%s existing_article_id=%s"
+                    ),
                     item.url,
+                    item.title,
                     content_hash_exists,
                 )
                 return metrics.add(skipped=1)
@@ -551,6 +714,11 @@ class MonitorPipeline:
                 select(ArticleFingerprint.id).where(ArticleFingerprint.fingerprint == fingerprint)
             )
             if fp_exists:
+                logger.info(
+                    "Duplicate detected during insert guard, skipping reason=fingerprint url=%s title=%s",
+                    item.url,
+                    item.title,
+                )
                 return metrics.add(skipped=1)
 
             try:
@@ -639,7 +807,11 @@ class MonitorPipeline:
                 alert_id = alert.id
             except IntegrityError:
                 session.rollback()
-                logger.info("Duplicate detected during insert, skipping url=%s", item.url)
+                logger.info(
+                    "Duplicate detected during insert, skipping reason=integrity_error url=%s title=%s",
+                    item.url,
+                    item.title,
+                )
                 return metrics.add(skipped=1)
 
         next_metrics = metrics.add(
@@ -651,6 +823,7 @@ class MonitorPipeline:
             context.add_recent_article(
                 article_id=article_id,
                 title=item.title,
+                url=item.url,
                 abstract=content.abstract,
                 text=content.full_text,
                 published_at=item.published_at,
@@ -768,6 +941,7 @@ class MonitorPipeline:
                 select(
                     Article.id,
                     Article.title,
+                    Article.url,
                     Article.abstract,
                     Article.article_text,
                     Article.published_at,
@@ -781,11 +955,12 @@ class MonitorPipeline:
             return []
 
         articles: list[_RecentArticle] = []
-        for article_id, title, abstract, text, published_at, created_at in rows:
+        for article_id, title, url, abstract, text, published_at, created_at in rows:
             articles.append(
                 _RecentArticle(
                     article_id=article_id,
                     title=title,
+                    url=url,
                     published_at=published_at,
                     created_at=created_at,
                     similarity_document=build_similarity_document(title, abstract, text),
@@ -840,7 +1015,7 @@ class MonitorPipeline:
             candidate.topic_document,
             [article.title for article in recent_articles],
             [article.topic_document for article in recent_articles],
-            threshold=self.similarity_dedupe_threshold,
+            threshold=self.digest_topic_dedupe_threshold,
         )
         if match is None:
             return None
@@ -850,6 +1025,7 @@ class MonitorPipeline:
             article_id=matched_article.article_id,
             score=match.score,
             title=matched_article.title,
+            url=matched_article.url,
             shared_title_terms=match.shared_title_terms,
         )
 

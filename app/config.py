@@ -41,7 +41,8 @@ class Settings:
     min_victim_confidence: float
     incident_dedupe_window_hours: int
     near_duplicate_enabled: bool
-    similarity_dedupe_threshold: float
+    stored_near_duplicate_threshold: float
+    current_run_near_duplicate_threshold: float
     near_duplicate_lookback_hours: int | None
     near_duplicate_max_comparisons: int
     suppress_out_of_scope_digest: bool
@@ -49,6 +50,7 @@ class Settings:
     digest_recipient_email: str
     digest_max_items_per_run: int
     digest_topic_dedupe_enabled: bool
+    digest_topic_dedupe_threshold: float
     digest_topic_dedupe_lookback_hours: int
     abstract_max_chars: int
     max_victim_words: int
@@ -127,7 +129,8 @@ def load_settings() -> Settings:
         min_victim_confidence=_parse_float_env("MIN_VICTIM_CONFIDENCE", 0.65),
         incident_dedupe_window_hours=_parse_int_env("INCIDENT_DEDUPE_WINDOW_HOURS", 48),
         near_duplicate_enabled=_parse_bool_env("NEAR_DUPLICATE_ENABLED", True),
-        similarity_dedupe_threshold=_parse_float_env("SIMILARITY_DEDUPE_THRESHOLD", 0.30),
+        stored_near_duplicate_threshold=_parse_float_env("STORED_NEAR_DUPLICATE_THRESHOLD", 0.38),
+        current_run_near_duplicate_threshold=_parse_float_env("CURRENT_RUN_NEAR_DUPLICATE_THRESHOLD", 0.34),
         near_duplicate_lookback_hours=_parse_optional_int_env("NEAR_DUPLICATE_LOOKBACK_HOURS"),
         near_duplicate_max_comparisons=_parse_int_env("NEAR_DUPLICATE_MAX_COMPARISONS", 500),
         suppress_out_of_scope_digest=_parse_bool_env("SUPPRESS_OUT_OF_SCOPE_DIGEST", True),
@@ -135,6 +138,7 @@ def load_settings() -> Settings:
         digest_recipient_email=digest_recipient_email,
         digest_max_items_per_run=_parse_int_env("DIGEST_MAX_ITEMS_PER_RUN", 100),
         digest_topic_dedupe_enabled=_parse_bool_env("DIGEST_TOPIC_DEDUPE_ENABLED", True),
+        digest_topic_dedupe_threshold=_parse_float_env("DIGEST_TOPIC_DEDUPE_THRESHOLD", 0.40),
         digest_topic_dedupe_lookback_hours=_parse_int_env(
             "DIGEST_TOPIC_DEDUPE_LOOKBACK_HOURS",
             max_article_age_hours,

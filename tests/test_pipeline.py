@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -147,7 +148,8 @@ def _settings(db_url: str) -> Settings:
         min_victim_confidence=0.65,
         incident_dedupe_window_hours=48,
         near_duplicate_enabled=True,
-        similarity_dedupe_threshold=0.30,
+        stored_near_duplicate_threshold=0.38,
+        current_run_near_duplicate_threshold=0.34,
         near_duplicate_lookback_hours=None,
         near_duplicate_max_comparisons=500,
         suppress_out_of_scope_digest=True,
@@ -155,6 +157,7 @@ def _settings(db_url: str) -> Settings:
         digest_recipient_email="digest@example.com",
         digest_max_items_per_run=100,
         digest_topic_dedupe_enabled=True,
+        digest_topic_dedupe_threshold=0.40,
         digest_topic_dedupe_lookback_hours=168,
         abstract_max_chars=420,
         max_victim_words=8,
@@ -394,6 +397,284 @@ def test_pipeline_current_run_near_duplicate_keeps_newest_when_enabled() -> None
         articles = session.scalars(select(Article)).all()
         assert len(articles) == 1
         assert articles[0].url == "https://example.com/new-near"
+
+
+def test_pipeline_current_run_duplicate_prefers_primary_source_over_newer_rewrite(caplog) -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://www.microsoft.com/en-us/security/blog/ai-brands-as-bait": ArticleContent(
+                full_text=(
+                    "Microsoft Threat Intelligence observed phishing, malvertising, and SEO poisoning "
+                    "campaigns using AI brands as bait. Attackers impersonated OpenAI, Anthropic, and "
+                    "DeepSeek to lure victims into credential theft pages and malicious downloads."
+                ),
+                abstract="Researchers reported an uptick in attacks.",
+            ),
+            "https://www.itpro.com/security/cyber-attacks/ai-hype-social-engineering": ArticleContent(
+                full_text=(
+                    "Threat actors are using trusted AI brands as bait in phishing, malvertising, and "
+                    "search engine optimization abuse. Campaigns impersonate OpenAI, Anthropic, and "
+                    "DeepSeek to lure victims into credential theft pages and malicious downloads."
+                ),
+                abstract="Security researchers warned about evolving social engineering activity.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+    )
+
+    caplog.set_level(logging.INFO, logger="app.pipeline")
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle(
+                "Google News",
+                "rss",
+                "AI brands as bait: How threat actors are using the AI hype in social engineering - Microsoft",
+                "https://www.microsoft.com/en-us/security/blog/ai-brands-as-bait",
+                now,
+            ),
+            SourceArticle(
+                "Google News",
+                "rss",
+                "Hackers are capitalizing on AI hype to ramp up social engineering attacks - IT Pro",
+                "https://www.itpro.com/security/cyber-attacks/ai-hype-social-engineering",
+                now + timedelta(minutes=10),
+            ),
+        ]
+    )
+
+    assert metrics.alerts_sent == 1
+    assert metrics.skipped == 1
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        assert len(articles) == 1
+        assert articles[0].url == "https://www.microsoft.com/en-us/security/blog/ai-brands-as-bait"
+
+    assert "reason=near_similarity" in caplog.text
+    assert "title=Hackers are capitalizing on AI hype" in caplog.text
+    assert "survivor_title=AI brands as bait" in caplog.text
+    assert "similarity_score=" in caplog.text
+
+
+def test_pipeline_current_run_threshold_controls_current_matches() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/old-near": ArticleContent(
+                full_text="WhatsApp disrupted NSO spyware phishing attacks against users.",
+                abstract="WhatsApp disrupted NSO-linked spyware phishing attacks.",
+            ),
+            "https://example.com/new-near": ArticleContent(
+                full_text="Meta said WhatsApp disrupted new spyware attacks linked to NSO Group.",
+                abstract="WhatsApp disrupted NSO-linked spyware activity.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        current_run_near_duplicate_threshold=0.90,
+        digest_recipient_email="digest@example.com",
+        digest_topic_dedupe_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle("s1", "rss", "WhatsApp disrupts NSO spyware phishing", "https://example.com/old-near", now),
+            SourceArticle(
+                "s2",
+                "rss",
+                "Meta says WhatsApp disrupted NSO spyware",
+                "https://example.com/new-near",
+                now + timedelta(minutes=5),
+            ),
+        ]
+    )
+
+    assert metrics.skipped == 0
+    assert metrics.digest_queued == 2
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 2
+
+
+def test_pipeline_low_score_near_duplicate_skips_with_salient_title_overlap() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/payroll-one": ArticleContent(
+                full_text="Acme employees received phishing emails that used fake login pages to steal credentials.",
+                abstract="",
+            ),
+            "https://example.com/payroll-two": ArticleContent(
+                full_text="Acme staff were warned about phishing messages with fake login pages designed to steal credentials.",
+                abstract="",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        current_run_near_duplicate_threshold=0.30,
+        digest_recipient_email="digest@example.com",
+        digest_topic_dedupe_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle(
+                "s1",
+                "rss",
+                "Acme payroll scam targets employees",
+                "https://example.com/payroll-one",
+                now,
+            ),
+            SourceArticle(
+                "s2",
+                "rss",
+                "Acme payroll scam warning for staff",
+                "https://example.com/payroll-two",
+                now + timedelta(minutes=5),
+            ),
+        ]
+    )
+
+    assert metrics.skipped == 1
+    assert metrics.digest_queued == 1
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 1
+
+
+def test_pipeline_low_score_near_duplicate_survives_without_title_or_entity_overlap() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/chrome": ArticleContent(
+                full_text="Acme employees received phishing emails that used fake login pages to steal credentials.",
+                abstract="",
+            ),
+            "https://example.com/exchange": ArticleContent(
+                full_text="Acme staff were warned about phishing messages with fake login pages designed to steal credentials.",
+                abstract="",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        current_run_near_duplicate_threshold=0.30,
+        digest_recipient_email="digest@example.com",
+        digest_topic_dedupe_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle("s1", "rss", "Chrome flaw exploited in attacks", "https://example.com/chrome", now),
+            SourceArticle(
+                "s2",
+                "rss",
+                "Microsoft Exchange zero-day patched",
+                "https://example.com/exchange",
+                now + timedelta(minutes=5),
+            ),
+        ]
+    )
+
+    assert metrics.skipped == 0
+    assert metrics.digest_queued == 2
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 2
+
+
+def test_pipeline_high_score_near_duplicate_skips_without_title_overlap() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/chrome": ArticleContent(
+                full_text=(
+                    "Employees received phishing emails that used fake login pages to steal credentials. "
+                    "The messages copied company branding and asked staff to reset passwords. Security teams "
+                    "found the campaign used lookalike domains and credential harvesting forms."
+                ),
+                abstract="",
+            ),
+            "https://example.com/exchange": ArticleContent(
+                full_text=(
+                    "Staff were warned about phishing messages with fake login pages designed to steal credentials. "
+                    "The campaign copied company branding and asked employees to reset passwords. Analysts found "
+                    "lookalike domains and credential harvesting forms."
+                ),
+                abstract="",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        current_run_near_duplicate_threshold=0.30,
+        digest_recipient_email="digest@example.com",
+        digest_topic_dedupe_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle("s1", "rss", "Chrome flaw exploited in attacks", "https://example.com/chrome", now),
+            SourceArticle(
+                "s2",
+                "rss",
+                "Microsoft Exchange zero-day patched",
+                "https://example.com/exchange",
+                now + timedelta(minutes=5),
+            ),
+        ]
+    )
+
+    assert metrics.skipped == 1
+    assert metrics.digest_queued == 1
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 1
 
 
 def test_pipeline_current_run_near_duplicates_both_survive_when_disabled() -> None:
@@ -704,6 +985,7 @@ def test_pipeline_skips_digest_topic_duplicate_using_article_text() -> None:
         digest_enabled=True,
         digest_recipient_email="digest@example.com",
         near_duplicate_enabled=False,
+        digest_topic_dedupe_threshold=0.35,
     )
 
     now = datetime.now(timezone.utc)
@@ -735,6 +1017,63 @@ def test_pipeline_skips_digest_topic_duplicate_using_article_text() -> None:
     with database.session() as session:
         assert len(session.scalars(select(Article)).all()) == 1
         assert len(session.scalars(select(Alert)).all()) == 1
+
+
+def test_pipeline_digest_topic_threshold_controls_digest_matches() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/meta-one": ArticleContent(
+                full_text="Meta said NSO spyware operators targeted WhatsApp users with one-click phishing attempts.",
+                abstract="Meta said NSO spyware operators targeted WhatsApp users with one-click phishing attempts.",
+            ),
+            "https://example.com/meta-two": ArticleContent(
+                full_text="These attempts were similar to previous one-click phishing campaigns aimed at WhatsApp users.",
+                abstract="These attempts were similar to previous one-click phishing campaigns aimed at WhatsApp users.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        digest_enabled=True,
+        digest_recipient_email="digest@example.com",
+        near_duplicate_enabled=False,
+        digest_topic_dedupe_threshold=0.90,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle(
+                "first",
+                "rss",
+                "Meta to take legal action against Israeli spyware company NSO - Al Jazeera",
+                "https://example.com/meta-one",
+                now + timedelta(minutes=10),
+            ),
+            SourceArticle(
+                "second",
+                "rss",
+                "Meta takes legal action against Israeli spyware firm NSO - The Straits Times",
+                "https://example.com/meta-two",
+                now,
+            ),
+        ]
+    )
+
+    assert metrics.skipped == 0
+    assert metrics.digest_queued == 2
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 2
+        assert len(session.scalars(select(Alert)).all()) == 2
 
 
 def test_pipeline_keeps_digest_items_with_only_generic_title_overlap() -> None:
@@ -1016,6 +1355,66 @@ def test_pipeline_skips_stored_near_duplicate_from_cached_recent_articles() -> N
 
     with database.session() as session:
         assert len(session.scalars(select(Article)).all()) == 1
+
+
+def test_pipeline_stored_near_threshold_controls_stored_matches() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/stored-near": ArticleContent(
+                full_text="WhatsApp disrupted NSO spyware phishing attacks against users.",
+                abstract="WhatsApp disrupted NSO-linked spyware phishing attacks.",
+            ),
+            "https://example.com/new-near": ArticleContent(
+                full_text="Meta said WhatsApp disrupted new spyware phishing attacks linked to NSO Group.",
+                abstract="WhatsApp disrupted NSO-linked spyware phishing activity.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        stored_near_duplicate_threshold=0.90,
+        digest_recipient_email="digest@example.com",
+        digest_topic_dedupe_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    first_metrics = pipeline.run(
+        [
+            SourceArticle(
+                "s1",
+                "rss",
+                "WhatsApp says it disrupted new NSO spyware phishing attacks",
+                "https://example.com/stored-near",
+                now,
+            )
+        ]
+    )
+    second_metrics = pipeline.run(
+        [
+            SourceArticle(
+                "s2",
+                "rss",
+                "WhatsApp says it disrupted new NSO spyware phishing attacks - BleepingComputer",
+                "https://example.com/new-near",
+                now + timedelta(minutes=5),
+            )
+        ]
+    )
+
+    assert first_metrics.digest_queued == 1
+    assert second_metrics.skipped == 0
+    assert second_metrics.digest_queued == 1
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 2
 
 
 def test_pipeline_batches_stored_exact_key_skips() -> None:

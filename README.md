@@ -63,7 +63,8 @@ Optional runtime controls:
 - `MIN_VICTIM_CONFIDENCE` (default: `0.65`)
 - `INCIDENT_DEDUPE_WINDOW_HOURS` (default: `48`)
 - `NEAR_DUPLICATE_ENABLED` (default: `true`)
-- `SIMILARITY_DEDUPE_THRESHOLD` (default: `0.30`)
+- `STORED_NEAR_DUPLICATE_THRESHOLD` (default: `0.38`)
+- `CURRENT_RUN_NEAR_DUPLICATE_THRESHOLD` (default: `0.34`)
 - `NEAR_DUPLICATE_LOOKBACK_HOURS` (default: fallback to `INCIDENT_DEDUPE_WINDOW_HOURS`)
 - `NEAR_DUPLICATE_MAX_COMPARISONS` (default: `500`)
 - `SUPPRESS_OUT_OF_SCOPE_DIGEST` (default: `true`)
@@ -71,6 +72,7 @@ Optional runtime controls:
 - `DIGEST_RECIPIENT_EMAIL` (default: fallback to `RECIPIENT_EMAIL`)
 - `DIGEST_MAX_ITEMS_PER_RUN` (default: `100`)
 - `DIGEST_TOPIC_DEDUPE_ENABLED` (default: `true`)
+- `DIGEST_TOPIC_DEDUPE_THRESHOLD` (default: `0.40`)
 - `DIGEST_TOPIC_DEDUPE_LOOKBACK_HOURS` (default: fallback to `MAX_ARTICLE_AGE_HOURS`)
 - `ABSTRACT_MAX_CHARS` (default: `420`)
 - `MAX_VICTIM_WORDS` (default: `8`)
@@ -133,12 +135,13 @@ Each candidate article is freshness-filtered and deduplicated by batched stored-
 1. **Source freshness**: drops dated source items older than `MAX_ARTICLE_AGE_HOURS`; missing dates are retained.
 2. **Canonical URL**: strips tracking parameters (`utm_*`, `gclid`, `fbclid`) and normalizes URL parts.
 3. **Content hash**: SHA-256 over normalized full text to skip exact body duplicates.
-4. **TF-IDF cosine similarity**: compares normalized title + abstract + article-text prefix against recent stored articles to skip near-duplicates.
+4. **Stored TF-IDF cosine similarity**: compares normalized title + abstract + article-text prefix against recent stored articles using `STORED_NEAR_DUPLICATE_THRESHOLD`.
 5. **Fingerprint hash**: SHA-256 over normalized title + article text prefix.
 6. **Incident key**: SHA-256 over normalized `(victim + attack type)` with a time window (`INCIDENT_DEDUPE_WINDOW_HOURS`) to skip same-victim incident follow-ups.
-7. **Digest-topic similarity**: compares title + abstract + article-text prefix for non-immediate items and requires shared salient headline terms before skipping.
+7. **Current-run TF-IDF grouping**: groups same-run near duplicates using `CURRENT_RUN_NEAR_DUPLICATE_THRESHOLD`; source priority chooses the survivor before newest-published tie-breaking.
+8. **Digest-topic similarity**: compares title + abstract + article-text prefix for non-immediate items using `DIGEST_TOPIC_DEDUPE_THRESHOLD` and requires shared salient headline terms before skipping.
 
-If canonical URL, content hash, near-duplicate similarity, fingerprint, incident key, or digest-topic similarity already matches, the article is skipped.
+Near-duplicate scores below `0.35` must also share salient headline terms or named entities before the article is skipped. If canonical URL, content hash, near-duplicate similarity, fingerprint, incident key, or digest-topic similarity already matches, the article is skipped.
 
 ## Alert Qualification Flow (Two Channels)
 
