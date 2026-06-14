@@ -50,7 +50,7 @@ Scope excludes `.git` internals and cache artifacts (for example `__pycache__`, 
 ### 2.2 Application Package (`app/`)
 
 - `main.py`: program entrypoint and source aggregation.
-- `pipeline.py`: orchestration of fetch/classify/extract/persist/send.
+- `pipeline/`: package for monitor orchestration, dedupe, stored lookups, routing, survivor processing, and shared pipeline state.
 - `config.py`: env loading and typed settings model.
 - `db.py`: SQLAlchemy engine/session wrapper.
 - `models.py`: ORM schema.
@@ -66,7 +66,7 @@ Scope excludes `.git` internals and cache artifacts (for example `__pycache__`, 
 - `sources/rss.py`: RSS adapter with Google News URL decoding support.
 - `sources/google_news.py`: Google News RSS specialization.
 - `sources/gdelt.py`: GDELT Doc API adapter.
-- `__init__.py` files: package markers only, no exports.
+- `__init__.py` files: package markers except `pipeline/__init__.py`, which exports the pipeline public API.
 
 ### 2.3 Test Package (`tests/`)
 
@@ -431,183 +431,81 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 - Side effects: mutates root logging configuration via `logging.basicConfig`.
 - Consumer: `main()`.
 
-## 6.3 `app/pipeline.py`
+## 6.3 `app/pipeline/`
 
-#### `logger`
+The pipeline package owns article processing after source aggregation. It exposes only `MonitorPipeline` and `PipelineMetrics` at package level; internal dataclasses and mixin methods live in responsibility-specific modules.
 
-- Module logger for exception/error diagnostics.
+#### `__init__.py`
 
-#### Constants and Pattern Objects
+- Public API: `MonitorPipeline`, `PipelineMetrics`.
+- Consumer: `app.main` constructs `MonitorPipeline` through this package API.
 
-- `LOW_SCORE_DUPLICATE_GUARD_THRESHOLD`: score boundary below which near-duplicate matches need extra title/entity evidence.
-- `AGGREGATOR_SOURCE_NAMES`: low-priority source names for survivor selection.
-- `PRIMARY_SOURCE_DOMAINS`: high-priority source domains that should win duplicate survivor selection.
-- `REWRITE_SOURCE_DOMAINS`: low-priority rewrite/aggregator domains.
-- `KNOWN_ENTITY_TERMS`: entity tokens recognized even when lowercased by source titles.
-- `NAMED_ENTITY_TOKEN_RE`: title token pattern used for lightweight named-entity overlap.
+#### `metrics.py`
 
-#### `_clip(value: str, max_len: int) -> str`
+- `PipelineMetrics` (`@dataclass(frozen=True)`)
+  - Fields: `processed`, `alerts_sent`, `digest_sent`, `digest_queued`, `skipped`, `errors`.
+  - Purpose: immutable run counters returned by `MonitorPipeline.run()`.
+  - `add(...)`: returns a new metrics instance with selected counters incremented.
 
-- Purpose: hard truncate string to DB-safe length.
-- Input: raw `value`, `max_len`.
-- Output: original if short else prefix slice.
-- Consumers: field preparation before ORM insert.
+#### `state.py`
 
-#### `_normalized_host(url: str) -> str`
+- `_DigestQueueEntry`: binds a persisted digest alert row to a later `DigestEmailItem`.
+- `_TopicDuplicateResult`: carries best digest-topic duplicate match details for logging and skip decisions.
+- `_FetchedCandidate`: carries fetched article text, dedupe keys, source metadata, original order, and optional replacement target.
+- `_PreparedInput`: carries canonicalized source input before article body fetch.
+- `_RecentArticle`: normalized cached stored-article payload with precomputed similarity and topic documents.
+- `_RunDedupeContext`: mutable per-run cache for stored canonical URLs, exact-key maps, recent articles, and comparison limits.
 
-- Purpose: normalize URL hostnames for source-priority domain matching.
-- Behavior: lowercases host and strips leading `www.`.
+#### `policy.py`
 
-#### `_host_matches(host: str, domains: set[str]) -> bool`
+- Constants: `LOW_SCORE_DUPLICATE_GUARD_THRESHOLD`, `AGGREGATOR_SOURCE_NAMES`, `PRIMARY_SOURCE_DOMAINS`, `REWRITE_SOURCE_DOMAINS`, `KNOWN_ENTITY_TERMS`, `NAMED_ENTITY_TOKEN_RE`.
+- Helpers:
+  - `_clip(...)`: truncates values before ORM persistence.
+  - `_normalized_host(...)` and `_host_matches(...)`: support source-priority domain matching.
+  - `_named_entity_terms(...)` and `_shared_named_entity_terms(...)`: support low-score near-duplicate guard evidence.
 
-- Purpose: match exact domains and subdomains against priority domain sets.
+#### `monitor.py`
 
-#### `_named_entity_terms(title: str) -> set[str]`
+- `MonitorPipeline`
+  - Constructor injects `Database`, `ArticleFetcher`, `AttackClassifier`, `VictimExtractor`, `Emailer`, thresholds, lookback windows, digest controls, and suppression policy.
+  - `run(articles)`: canonicalizes inputs, builds a run context, fetches candidates, applies stored exact dedupe, current-run dedupe, stored near dedupe/replacement, survivor processing, and one final digest flush.
+  - `_build_run_dedupe_context(...)`: loads stored canonical URL matches and recent article comparison data once per run.
+  - `_fetch_candidate(...)`: fetches article content and builds fingerprint, content hash, similarity document, and topic document.
 
-- Purpose: extract lightweight named-entity title tokens for low-score near-duplicate guard evidence.
-- Behavior: ignores trailing source suffixes and short generic tokens.
+#### `dedupe.py`
 
-#### `_shared_named_entity_terms(left_title, right_title) -> tuple[str, ...]`
+- `DedupeMixin`
+  - `_filter_stored_exact_duplicates(...)`: skips candidates matching stored content hash or fingerprint maps loaded in batch.
+  - `_filter_stored_near_duplicates(...)`: compares candidates against cached recent articles, skips equal/lower-priority matches, and marks higher-priority incoming stories as replacements.
+  - `_dedupe_current_run_candidates(...)`: groups same-run canonical/content/fingerprint/near-similarity duplicates and keeps the highest-priority survivor.
+  - Source-priority helpers rank primary domains above neutral sources, neutral sources above aggregators, and known rewrite domains lowest.
+  - Low-score near-similarity matches require salient title overlap or shared named-entity evidence before suppression or replacement.
 
-- Purpose: return shared named-entity evidence between two titles.
+#### `storage.py`
 
-#### `PipelineMetrics` (`@dataclass(frozen=True)`)
+- `StorageMixin`
+  - `_load_existing_canonical_urls(...)`: batched canonical URL lookup before article fetch.
+  - `_load_existing_exact_keys(...)`: batched content-hash and fingerprint lookup after article fetch.
+  - `_load_recent_articles(...)`: loads recent stored articles and precomputes similarity/topic documents.
+  - `_has_recent_incident_duplicate(...)`: checks incident-key duplicates within the configured window, excluding replacement targets when needed.
+  - `_find_digest_topic_duplicate(...)`: checks non-immediate items against cached recent articles using topic-document similarity and title-overlap evidence.
 
-- Fields: `processed`, `alerts_sent`, `digest_sent`, `digest_queued`, `skipped`, `errors`.
-- Purpose: immutable run counters returned by `run()`.
-- `add(...)`: returns a new metrics instance with selected counters incremented.
+#### `processing.py`
 
-#### `_DigestQueueEntry` (`@dataclass(frozen=True)`)
+- `ProcessingMixin`
+  - `_process_prepared(...)`: classifies, extracts victim data, builds incident key, applies incident and digest-topic duplicate guards, inserts or replaces the `Article`, upserts the fingerprint, creates the `Alert`, updates run context, and sends immediate alerts when eligible.
+  - Replacement candidates exclude their target article from canonical/content-hash/fingerprint, incident, and digest-topic self-matches.
+  - DB duplicate races and replacement conflicts roll back and count as skips.
+  - Immediate send failures mark the alert `failed` without incrementing the pipeline `errors` counter.
 
-- Fields: `alert_id`, `item: DigestEmailItem`.
-- Purpose: binds persisted digest alert row to later digest email payload.
+#### `routing.py`
 
-#### `_TopicDuplicateResult` (`@dataclass(frozen=True)`)
-
-- Fields: `article_id`, `score`, `title`, `url`, `shared_title_terms`.
-- Purpose: carries the best digest-topic duplicate match for logging and skip decisions.
-
-#### `_FetchedCandidate` (`@dataclass(frozen=True)`)
-
-- Fields: `item`, `content`, `canonical_url`, `fingerprint`, `content_hash`, `similarity_document`, `topic_document`, `original_index`, optional `replacement_article_id`.
-- Purpose: carries fetched article content and dedupe keys between preparation, current-run dedupe, stored near replacement decisions, and survivor processing.
-
-#### `_PreparedInput` (`@dataclass(frozen=True)`)
-
-- Fields: `item`, `canonical_url`, `original_index`.
-- Purpose: carries canonicalized source items after the batched stored canonical-URL check and before article fetch.
-
-#### `_RecentArticle` (`@dataclass(frozen=True)`)
-
-- Fields: `article_id`, `source_name`, `source_type`, `title`, `url`, `published_at`, `created_at`, `similarity_document`, `topic_document`.
-- Purpose: normalized payload loaded once per run for stored near-duplicate and digest-topic duplicate checks.
-
-#### `_RunDedupeContext` (`@dataclass`)
-
-- Fields: stored canonical URL set, stored content-hash/fingerprint maps, cached recent articles, comparison cap.
-- Purpose: mutable per-run cache for batched DB dedupe and current-run additions visible to digest-topic checks.
-- `add_recent_article(...)`: appends a newly persisted article to the run cache while honoring `near_duplicate_max_comparisons`.
-
-#### `MonitorPipeline`
-
-Constructor:
-
-`__init__(database, fetcher, classifier, victim_extractor, emailer, min_victim_confidence=0.65, incident_dedupe_window_hours=48, near_duplicate_enabled=True, stored_near_duplicate_threshold=0.38, current_run_near_duplicate_threshold=0.34, near_duplicate_lookback_hours=None, near_duplicate_max_comparisons=500, suppress_out_of_scope_digest=True, digest_enabled=True, digest_recipient_email=None, digest_max_items_per_run=100, digest_topic_dedupe_enabled=True, digest_topic_dedupe_threshold=0.40, digest_topic_dedupe_lookback_hours=168)`
-
-- Purpose: inject all collaborators and policy controls.
-
-Methods:
-
-- `run(articles: list[SourceArticle]) -> PipelineMetrics`
-  - Canonicalizes inputs, performs batched stored-key checks, fetches candidates, dedupes the current run in memory, applies stored near skip/replacement decisions, processes survivors, and flushes digest.
-  - Counts every input article as processed; skips DB duplicates, fetch failures, current-run duplicate losers, and lower/equal-priority stored near-duplicates.
-  - Catches unhandled per-item exceptions, increments `errors`, continues run.
-
-- `_build_run_dedupe_context(prepared_inputs) -> _RunDedupeContext`
-  - Loads stored canonical URL matches and recent article similarity/topic documents once for the run.
-
-- `_load_existing_canonical_urls(canonical_urls) -> set[str]`
-  - Performs a batched lookup for already-stored canonical URLs.
-
-- `_fetch_candidate(prepared) -> _FetchedCandidate | None`
-  - Fetches article content and builds fingerprint, content-hash, similarity, and topic documents.
-
-- `_filter_stored_exact_duplicates(candidates, context) -> tuple[list[_FetchedCandidate], int]`
-  - Applies batched stored content-hash and fingerprint duplicate checks.
-
-- `_filter_stored_near_duplicates(candidates, context) -> tuple[list[_FetchedCandidate], int]`
-  - Applies batched TF-IDF candidate-vs-recent comparisons using cached recent documents, `stored_near_duplicate_threshold`, per-candidate lookback windows, and the low-score guard.
-  - Skips incoming matches when stored source priority is equal or higher.
-  - Marks incoming matches with `replacement_article_id` when incoming source priority is strictly higher than the stored match.
-
-- `_dedupe_current_run_candidates(candidates) -> tuple[list[_FetchedCandidate], int]`
-  - Groups prepared candidates by exact dedupe keys and optional near-duplicate similarity.
-  - Uses `current_run_near_duplicate_threshold` and the low-score guard for current-run near-duplicate grouping.
-  - Keeps the highest source-priority survivor; missing timestamps compare older than real timestamps, with input order as final tie-breaker.
-  - Returns survivor candidates in original input order plus the duplicate loser count.
-
-- `_candidate_survivor_key(candidate) -> tuple[int, datetime, int]`
-  - Builds the current-run survivor priority key from source priority, UTC publication time, and inverse input index.
-
-- `_candidate_source_priority(candidate) -> int`, `_recent_article_source_priority(article) -> int`, `_source_priority(source_name, url) -> int`
-  - Score source/domain quality for current-run duplicate survivor selection and stored near replacement decisions.
-  - Primary domains beat neutral sources, neutral sources beat aggregators, and known rewrite domains are lowest priority.
-
-- `_passes_low_score_duplicate_guard(score, left_title, right_title) -> bool`
-  - Allows scores at or above `LOW_SCORE_DUPLICATE_GUARD_THRESHOLD` (`0.40`).
-  - For lower scores, requires shared salient title terms or shared named-entity terms.
-
-- `_within_near_duplicate_window(left, right) -> bool`
-  - Applies `near_duplicate_lookback_hours` to current-run near-duplicate pairs when both timestamps are known.
-
-- `_process_prepared(candidate, digest_queue, metrics, context) -> PipelineMetrics`
-  - Full survivor flow (classify, extract, incident dedupe, insert or replacement update, send/queue).
-  - Keeps final canonical/content-hash/fingerprint DB guards for concurrent-run races and replacement conflicts.
-  - Replacement candidates update the existing `Article`, update or create its fingerprint row, and create a new `Alert` through normal routing.
-  - Replacement candidates exclude the replacement target from incident, topic, canonical, content-hash, and fingerprint duplicate checks so the target does not block its own update.
-  - Skips duplicate incidents before persistence instead of queueing them into digest.
-  - Skips non-immediate digest-topic duplicates before persistence.
-  - Stores out-of-scope articles as skipped digest alerts when suppression is enabled.
-  - Adds successfully persisted articles to the run dedupe context for later same-run topic checks.
-  - Handles DB duplicate races via `IntegrityError` rollback and skip accounting.
-  - Immediate send failures do not increment `errors`; they mark alert row as `failed`.
-
-- `_build_immediate_email(item, content, classification, victim) -> AlertEmail`
-  - Builds the immediate alert subject/body once for persistence and SMTP send.
-
-- `_build_digest_audit_body(item, classification, victim, routing_reason) -> str`
-  - Builds the persisted digest placeholder/audit body for queued or skipped digest alerts.
-
-- `_routing_reason(article_type, attack_type, has_confident_victim, duplicate_incident) -> str`
-  - Routing decision helper.
-  - Return values: `duplicate_incident`, non-incident article type, `out_of_taxonomy`, `low_victim_confidence`, `qualified_incident`.
-
-- `_has_recent_incident_duplicate(incident_key, candidate_time, exclude_article_id=None) -> bool`
-  - Finds prior articles with same incident key and compares UTC time delta to configured window.
-  - Ignores `exclude_article_id` for stored near replacement reprocessing.
-  - If candidate time is missing but matches exist, returns `True` conservatively.
-
-- `_load_recent_articles() -> list[_RecentArticle]`
-  - Loads recent stored article text/metadata up to `near_duplicate_max_comparisons` and precomputes similarity/topic documents.
-
-- `_recent_articles_for_window(recent_articles, candidate_time, lookback_hours) -> list[_RecentArticle]`
-  - Filters cached recent articles according to the candidate timestamp and supplied lookback.
-
-- `_recent_article_within_window(article, candidate_time, lookback_hours) -> bool`
-  - Shared time-window predicate for stored near-duplicate and digest-topic checks.
-
-- `_find_digest_topic_duplicate(candidate, candidate_time, context, exclude_article_id=None) -> _TopicDuplicateResult | None`
-  - Uses cached recent articles with digest-topic lookback settings.
-  - Applies `digest_topic_dedupe_lookback_hours` when candidate time is known.
-  - Ignores `exclude_article_id` for stored near replacement reprocessing.
-  - Uses precomputed topic documents, `digest_topic_dedupe_threshold`, and requires shared salient title terms.
-
-- `_flush_digest_queue(digest_queue, metrics) -> PipelineMetrics`
-  - Sends one digest email when enabled and queue non-empty.
-  - Updates queued alert rows with final status/body/subject.
-
-- `_published_date(published_at) -> str`
-  - Converts datetime to UTC ISO8601 string; returns `unknown` when absent.
+- `RoutingMixin`
+  - `_routing_reason(...)`: returns `duplicate_incident`, non-incident article type, `out_of_taxonomy`, `low_victim_confidence`, or `qualified_incident`.
+  - `_build_immediate_email(...)`: builds persisted and outbound immediate alert content.
+  - `_build_digest_audit_body(...)`: builds persisted audit body for queued or skipped digest alerts.
+  - `_flush_digest_queue(...)`: sends one digest email per run and updates queued alert rows with final subject/body/status/error.
+  - `_published_date(...)`: converts datetimes to UTC ISO8601 strings or `unknown`.
 
 ## 6.4 `app/alerts/emailer.py`
 
@@ -1018,13 +916,14 @@ Methods:
   - Converts `seendate` to UTC datetime when possible.
   - Emits `SourceArticle` list with `source_type='gdelt'` and `source_name='GDELT'`.
 
-## 6.13 Package Marker Modules
+## 6.13 Package Initializer Modules
 
 - `app/__init__.py`: no exported symbols.
 - `app/alerts/__init__.py`: no exported symbols.
 - `app/detection/__init__.py`: no exported symbols.
 - `app/dedup/__init__.py`: no exported symbols.
 - `app/fetch/__init__.py`: no exported symbols.
+- `app/pipeline/__init__.py`: exports `MonitorPipeline` and `PipelineMetrics`.
 - `app/sources/__init__.py`: no exported symbols.
 
 ---
@@ -1311,7 +1210,7 @@ Build behavior:
 - Improve extraction robustness by tuning `VICTIM_PATTERNS`, noise filters, and confidence heuristics.
 - Tune duplicate sensitivity through the stored/current-run/digest-topic threshold settings, lookback windows, source-priority domain sets, and comparison-count settings.
 - Introduce migration tooling (for example Alembic) to replace ad-hoc schema evolution in `initialize_schema`.
-- Add channel integrations by extending `Emailer` abstraction and `MonitorPipeline` alert dispatch branch.
+- Add channel integrations by extending the `Emailer` abstraction plus the pipeline routing and survivor-processing modules.
 
 ---
 
@@ -1322,4 +1221,4 @@ The symbols below are explicitly covered in this document:
 - All top-level classes/functions from `app/` and `tests/` discovered via `rg`.
 - All class methods and private helpers (`_...`) in runtime modules.
 - Key module objects/constants/pattern lists/regexes used for runtime decisions.
-- Empty `__init__.py` modules explicitly documented as no-export package markers.
+- Package initializer modules documented, including the `app.pipeline` public API export.

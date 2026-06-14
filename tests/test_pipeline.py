@@ -18,7 +18,8 @@ from app.dedup.deduplicator import (
 )
 from app.fetch.article_fetcher import ArticleContent
 from app.models import Alert, Article, ArticleFingerprint
-from app.pipeline import MonitorPipeline, PipelineMetrics, _FetchedCandidate, _RunDedupeContext
+from app.pipeline import MonitorPipeline, PipelineMetrics
+from app.pipeline.state import _FetchedCandidate, _RunDedupeContext
 from app.schema_init import initialize_schema
 from app.sources.base import SourceArticle
 

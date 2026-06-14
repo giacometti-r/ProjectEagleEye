@@ -20,7 +20,7 @@ Python 3.11 service that monitors free cybersecurity news sources (RSS, Google N
 ## Project Structure
 
 - `app/main.py`: single-run entrypoint
-- `app/pipeline.py`: routing/orchestration for immediate + digest channels
+- `app/pipeline/`: monitor orchestration, dedupe, storage lookups, routing, and survivor processing
 - `app/sources/`: RSS, Google News RSS, GDELT source adapters
 - `app/fetch/article_fetcher.py`: article extraction and abstract generation
 - `app/detection/`: attack classifier and victim extractor
