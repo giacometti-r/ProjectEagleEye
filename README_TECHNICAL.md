@@ -115,28 +115,32 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 
 ### 3.3 Pipeline Flow
 
-`MonitorPipeline.run()` executes the processing graph in three phases:
+`MonitorPipeline.run()` executes the processing graph in four phases:
 
 1. Candidate preparation for fetched `SourceArticle` items:
    - Canonical URL normalization plus one batched DB lookup on `Article.canonical_url` before article-body fetch.
    - Remote article fetch and parse (`ArticleFetcher.fetch`), skip on failure.
    - Fingerprint/content hash/similarity/topic document generation.
    - One batched stored content-hash/fingerprint lookup after fetch.
-   - One cached recent-article load for stored near-duplicate checks, with precomputed similarity/topic documents reused during the run.
+   - One cached recent-article load for stored near-duplicate checks, with source metadata and precomputed similarity/topic documents reused during the run.
 2. Current-run batch dedupe across prepared candidates:
    - Groups exact matches by canonical URL, content hash, and fingerprint.
    - Groups near-duplicates with TF-IDF cosine similarity when enabled and the current-run threshold is met.
    - Low-score near-duplicates must also share salient title terms or named entities.
    - Keeps the highest-priority source; ties keep the newest `published_at`, then the earlier input order.
-3. Survivor processing:
+3. Stored near-duplicate comparison after current-run survivor selection:
+   - Compares current-run survivors against cached recent stored articles using the stored-near threshold.
+   - Skips incoming matches when the stored source priority is equal or higher.
+   - Marks incoming matches as replacements when the incoming source priority is strictly higher than the stored match.
+4. Survivor processing:
    - Classification (`AttackClassifier.classify`), including cyber-scope gating.
    - Victim extraction (`VictimExtractor.extract`) with conservative noise rejection.
    - Incident key creation (`build_incident_key`) when attack + victim available.
-   - Cross-incident dedupe window check (`_has_recent_incident_duplicate`).
+   - Cross-incident dedupe window check (`_has_recent_incident_duplicate`), excluding the replacement target when applicable.
    - Duplicate incidents are skipped before persistence.
    - Immediate eligibility decision using article type + taxonomy + victim confidence + duplicate status.
-   - Digest-bound topic duplicate check using title + abstract + article-text prefix similarity and shared salient title terms.
-   - Transactional persistence of `Article`, `ArticleFingerprint`, and `Alert` row.
+   - Digest-bound topic duplicate check using title + abstract + article-text prefix similarity and shared salient title terms, excluding the replacement target when applicable.
+   - Transactional insert or replacement update of `Article`, upsert of `ArticleFingerprint`, and creation of a new `Alert` row.
    - Immediate SMTP send or digest queueing, followed by one run-level digest flush.
 
 ### 3.4 Channel Semantics
@@ -155,9 +159,9 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 2. Stored canonical URL dedupe (`articles.canonical_url` unique).
 3. Stored exact content hash dedupe (`articles.content_hash` lookup).
 4. Stored fingerprint dedupe (`article_fingerprints.fingerprint` unique).
-5. Stored near-duplicate dedupe (`TfidfVectorizer` + cosine similarity over cached recent stored articles using the stored-near threshold).
-6. Current-run exact dedupe by canonical URL, content hash, and fingerprint.
-7. Current-run near-duplicate dedupe using the current-run threshold/window settings plus the low-score guard.
+5. Current-run exact dedupe by canonical URL, content hash, and fingerprint.
+6. Current-run near-duplicate dedupe using the current-run threshold/window settings plus the low-score guard.
+7. Stored near-duplicate dedupe/replacement (`TfidfVectorizer` + cosine similarity over cached recent stored articles using the stored-near threshold and source priority).
 8. Incident-window dedupe (`articles.incident_key` + temporal comparison).
 9. Digest-topic dedupe (`TfidfVectorizer` over title + abstract + article-text prefix using the digest-topic threshold plus salient title-overlap guard).
 
@@ -262,8 +266,8 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 | `google_news_queries` | `GOOGLE_NEWS_QUERIES` | `list[str]` | no | `DEFAULT_GOOGLE_NEWS_QUERIES` | `_parse_list_env` | Instantiates `GoogleNewsRssSource` entries. |
 | `min_victim_confidence` | `MIN_VICTIM_CONFIDENCE` | `float` | no | `0.65` | `float(...)` | Threshold for immediate-channel eligibility. |
 | `incident_dedupe_window_hours` | `INCIDENT_DEDUPE_WINDOW_HOURS` | `int` | no | `48` | `int(...)` | Time window for incident-key suppression. |
-| `near_duplicate_enabled` | `NEAR_DUPLICATE_ENABLED` | `bool` | no | `true` | truthy set | Enables TF-IDF cosine near-duplicate skips. |
-| `stored_near_duplicate_threshold` | `STORED_NEAR_DUPLICATE_THRESHOLD` | `float` | no | `0.38` | `float(...)` | Minimum TF-IDF cosine score for stored recent-article near-duplicate checks. |
+| `near_duplicate_enabled` | `NEAR_DUPLICATE_ENABLED` | `bool` | no | `true` | truthy set | Enables TF-IDF cosine near-duplicate skips/replacements. |
+| `stored_near_duplicate_threshold` | `STORED_NEAR_DUPLICATE_THRESHOLD` | `float` | no | `0.38` | `float(...)` | Minimum TF-IDF cosine score for stored recent-article near-duplicate skip/replacement checks. |
 | `current_run_near_duplicate_threshold` | `CURRENT_RUN_NEAR_DUPLICATE_THRESHOLD` | `float` | no | `0.34` | `float(...)` | Minimum TF-IDF cosine score for current-run near-duplicate grouping. |
 | `near_duplicate_lookback_hours` | `NEAR_DUPLICATE_LOOKBACK_HOURS` | `int \| None` | no | fallback to incident window | optional `int(...)` | Time window for candidate comparison. |
 | `near_duplicate_max_comparisons` | `NEAR_DUPLICATE_MAX_COMPARISONS` | `int` | no | `500` | `int(...)` | Max recent articles loaded for similarity comparison. |
@@ -485,8 +489,8 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 
 #### `_FetchedCandidate` (`@dataclass(frozen=True)`)
 
-- Fields: `item`, `content`, `canonical_url`, `fingerprint`, `content_hash`, `similarity_document`, `topic_document`, `original_index`.
-- Purpose: carries fetched article content and dedupe keys between preparation, current-run dedupe, and survivor processing.
+- Fields: `item`, `content`, `canonical_url`, `fingerprint`, `content_hash`, `similarity_document`, `topic_document`, `original_index`, optional `replacement_article_id`.
+- Purpose: carries fetched article content and dedupe keys between preparation, current-run dedupe, stored near replacement decisions, and survivor processing.
 
 #### `_PreparedInput` (`@dataclass(frozen=True)`)
 
@@ -495,7 +499,7 @@ Source failures are isolated (`try/except` per source, warning logged). Dated it
 
 #### `_RecentArticle` (`@dataclass(frozen=True)`)
 
-- Fields: `article_id`, `title`, `url`, `published_at`, `created_at`, `similarity_document`, `topic_document`.
+- Fields: `article_id`, `source_name`, `source_type`, `title`, `url`, `published_at`, `created_at`, `similarity_document`, `topic_document`.
 - Purpose: normalized payload loaded once per run for stored near-duplicate and digest-topic duplicate checks.
 
 #### `_RunDedupeContext` (`@dataclass`)
@@ -515,8 +519,8 @@ Constructor:
 Methods:
 
 - `run(articles: list[SourceArticle]) -> PipelineMetrics`
-  - Canonicalizes inputs, performs batched stored-key checks, fetches candidates, dedupes the current run in memory, processes survivors, and flushes digest.
-  - Counts every input article as processed; skips DB duplicates, fetch failures, and current-run duplicate losers.
+  - Canonicalizes inputs, performs batched stored-key checks, fetches candidates, dedupes the current run in memory, applies stored near skip/replacement decisions, processes survivors, and flushes digest.
+  - Counts every input article as processed; skips DB duplicates, fetch failures, current-run duplicate losers, and lower/equal-priority stored near-duplicates.
   - Catches unhandled per-item exceptions, increments `errors`, continues run.
 
 - `_build_run_dedupe_context(prepared_inputs) -> _RunDedupeContext`
@@ -533,6 +537,8 @@ Methods:
 
 - `_filter_stored_near_duplicates(candidates, context) -> tuple[list[_FetchedCandidate], int]`
   - Applies batched TF-IDF candidate-vs-recent comparisons using cached recent documents, `stored_near_duplicate_threshold`, per-candidate lookback windows, and the low-score guard.
+  - Skips incoming matches when stored source priority is equal or higher.
+  - Marks incoming matches with `replacement_article_id` when incoming source priority is strictly higher than the stored match.
 
 - `_dedupe_current_run_candidates(candidates) -> tuple[list[_FetchedCandidate], int]`
   - Groups prepared candidates by exact dedupe keys and optional near-duplicate similarity.
@@ -543,20 +549,22 @@ Methods:
 - `_candidate_survivor_key(candidate) -> tuple[int, datetime, int]`
   - Builds the current-run survivor priority key from source priority, UTC publication time, and inverse input index.
 
-- `_source_priority(candidate) -> int`
-  - Scores source/domain quality for current-run duplicate survivor selection.
+- `_candidate_source_priority(candidate) -> int`, `_recent_article_source_priority(article) -> int`, `_source_priority(source_name, url) -> int`
+  - Score source/domain quality for current-run duplicate survivor selection and stored near replacement decisions.
   - Primary domains beat neutral sources, neutral sources beat aggregators, and known rewrite domains are lowest priority.
 
 - `_passes_low_score_duplicate_guard(score, left_title, right_title) -> bool`
-  - Allows scores at or above `LOW_SCORE_DUPLICATE_GUARD_THRESHOLD`.
+  - Allows scores at or above `LOW_SCORE_DUPLICATE_GUARD_THRESHOLD` (`0.40`).
   - For lower scores, requires shared salient title terms or shared named-entity terms.
 
 - `_within_near_duplicate_window(left, right) -> bool`
   - Applies `near_duplicate_lookback_hours` to current-run near-duplicate pairs when both timestamps are known.
 
 - `_process_prepared(candidate, digest_queue, metrics, context) -> PipelineMetrics`
-  - Full survivor flow (classify, extract, incident dedupe, persist, send/queue).
-  - Keeps final canonical/content-hash/fingerprint DB guards for concurrent-run races.
+  - Full survivor flow (classify, extract, incident dedupe, insert or replacement update, send/queue).
+  - Keeps final canonical/content-hash/fingerprint DB guards for concurrent-run races and replacement conflicts.
+  - Replacement candidates update the existing `Article`, update or create its fingerprint row, and create a new `Alert` through normal routing.
+  - Replacement candidates exclude the replacement target from incident, topic, canonical, content-hash, and fingerprint duplicate checks so the target does not block its own update.
   - Skips duplicate incidents before persistence instead of queueing them into digest.
   - Skips non-immediate digest-topic duplicates before persistence.
   - Stores out-of-scope articles as skipped digest alerts when suppression is enabled.
@@ -574,8 +582,9 @@ Methods:
   - Routing decision helper.
   - Return values: `duplicate_incident`, non-incident article type, `out_of_taxonomy`, `low_victim_confidence`, `qualified_incident`.
 
-- `_has_recent_incident_duplicate(incident_key, candidate_time) -> bool`
+- `_has_recent_incident_duplicate(incident_key, candidate_time, exclude_article_id=None) -> bool`
   - Finds prior articles with same incident key and compares UTC time delta to configured window.
+  - Ignores `exclude_article_id` for stored near replacement reprocessing.
   - If candidate time is missing but matches exist, returns `True` conservatively.
 
 - `_load_recent_articles() -> list[_RecentArticle]`
@@ -587,9 +596,10 @@ Methods:
 - `_recent_article_within_window(article, candidate_time, lookback_hours) -> bool`
   - Shared time-window predicate for stored near-duplicate and digest-topic checks.
 
-- `_find_digest_topic_duplicate(candidate, candidate_time, context) -> _TopicDuplicateResult | None`
+- `_find_digest_topic_duplicate(candidate, candidate_time, context, exclude_article_id=None) -> _TopicDuplicateResult | None`
   - Uses cached recent articles with digest-topic lookback settings.
   - Applies `digest_topic_dedupe_lookback_hours` when candidate time is known.
+  - Ignores `exclude_article_id` for stored near replacement reprocessing.
   - Uses precomputed topic documents, `digest_topic_dedupe_threshold`, and requires shared salient title terms.
 
 - `_flush_digest_queue(digest_queue, metrics) -> PipelineMetrics`
@@ -1170,6 +1180,8 @@ This section maps each test symbol to the production behavior it validates.
   - Contract: low-score near-duplicate matches can still skip when titles share salient terms.
 - `test_pipeline_low_score_near_duplicate_survives_without_title_or_entity_overlap()`
   - Contract: low-score near-duplicate matches survive when they lack title/entity evidence.
+- `test_pipeline_borderline_near_duplicate_survives_without_title_or_entity_overlap()`
+  - Contract: matches between the old and new low-score guard band survive without title/entity evidence.
 - `test_pipeline_high_score_near_duplicate_skips_without_title_overlap()`
   - Contract: high-score near-duplicate matches skip even without title/entity overlap.
 - `test_pipeline_current_run_near_duplicates_both_survive_when_disabled()`
@@ -1199,7 +1211,19 @@ This section maps each test symbol to the production behavior it validates.
 - `test_pipeline_skips_stored_near_duplicate_from_cached_recent_articles()`
   - Contract: a second run skips a stored near-duplicate using the run-level recent-article cache.
 - `test_pipeline_stored_near_threshold_controls_stored_matches()`
-  - Contract: `stored_near_duplicate_threshold` only controls stored recent-article near-duplicate skips.
+  - Contract: `stored_near_duplicate_threshold` only controls stored recent-article near-duplicate skip/replacement checks.
+- `test_pipeline_stored_near_duplicate_replaces_lower_priority_source_and_reprocesses()`
+  - Contract: a higher-priority incoming stored near-duplicate updates the existing article and runs normal alert routing.
+- `test_pipeline_stored_near_duplicate_keeps_higher_priority_stored_source()`
+  - Contract: a lower-priority incoming stored near-duplicate is skipped.
+- `test_pipeline_stored_near_duplicate_keeps_equal_priority_stored_source()`
+  - Contract: equal-priority stored near-duplicates do not rewrite stored history.
+- `test_pipeline_stored_replacement_excludes_target_from_digest_topic_dedupe()`
+  - Contract: replacement reprocessing excludes the target article from digest-topic self-matching.
+- `test_pipeline_current_run_survivor_is_selected_before_stored_near_replacement()`
+  - Contract: current-run source-priority survivor selection happens before stored near replacement decisions.
+- `test_pipeline_stored_replacement_conflict_skips_safely()`
+  - Contract: replacement conflicts with another stored article's exact dedupe keys skip without mutating the replacement target.
 - `test_pipeline_batches_stored_exact_key_skips()`
   - Contract: stored canonical, content-hash, and fingerprint duplicates are skipped through batched checks; canonical duplicates are not fetched.
 - `test_pipeline_suppresses_out_of_scope_digest_item()`

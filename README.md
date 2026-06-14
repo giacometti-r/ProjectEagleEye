@@ -13,7 +13,7 @@ Python 3.11 service that monitors free cybersecurity news sources (RSS, Google N
 - Source and article HTTP fetches use explicit timeouts and isolated sessions (`trust_env=False`).
 - Source queries and cyber-scope filters reject broad `impersonation`/`cybersecurity` matches unless they include digital threat context.
 - Cross-source incident dedupe: 48-hour incident-key dedupe to suppress syndicated rewrites in immediate channel.
-- TF-IDF cosine near-duplicate and digest-topic duplicate detection to skip syndicated/reworded articles before alerting.
+- TF-IDF cosine near-duplicate and digest-topic duplicate detection to suppress syndicated/reworded articles, with source-priority replacement for better stored near-duplicate coverage.
 - Boilerplate-resistant article cleanup and improved abstract generation with metadata fallback.
 - URL/fingerprint/content-hash dedupe plus conservative victim extraction and robust retries/logging.
 
@@ -135,13 +135,14 @@ Each candidate article is freshness-filtered and deduplicated by batched stored-
 1. **Source freshness**: drops dated source items older than `MAX_ARTICLE_AGE_HOURS`; missing dates are retained.
 2. **Canonical URL**: strips tracking parameters (`utm_*`, `gclid`, `fbclid`) and normalizes URL parts.
 3. **Content hash**: SHA-256 over normalized full text to skip exact body duplicates.
-4. **Stored TF-IDF cosine similarity**: compares normalized title + abstract + article-text prefix against recent stored articles using `STORED_NEAR_DUPLICATE_THRESHOLD`.
-5. **Fingerprint hash**: SHA-256 over normalized title + article text prefix.
-6. **Incident key**: SHA-256 over normalized `(victim + attack type)` with a time window (`INCIDENT_DEDUPE_WINDOW_HOURS`) to skip same-victim incident follow-ups.
-7. **Current-run TF-IDF grouping**: groups same-run near duplicates using `CURRENT_RUN_NEAR_DUPLICATE_THRESHOLD`; source priority chooses the survivor before newest-published tie-breaking.
-8. **Digest-topic similarity**: compares title + abstract + article-text prefix for non-immediate items using `DIGEST_TOPIC_DEDUPE_THRESHOLD` and requires shared salient headline terms before skipping.
+4. **Fingerprint hash**: SHA-256 over normalized title + article text prefix.
+5. **Current-run TF-IDF grouping**: groups same-run near duplicates using `CURRENT_RUN_NEAR_DUPLICATE_THRESHOLD`; source priority chooses the survivor before newest-published tie-breaking.
+6. **Stored TF-IDF cosine similarity**: compares normalized title + abstract + article-text prefix against recent stored articles using `STORED_NEAR_DUPLICATE_THRESHOLD`.
+7. **Stored near-duplicate replacement**: if the incoming stored near-duplicate has strictly higher source priority than the stored match, the stored `Article` row is updated with the incoming source/content and normal alert or digest routing runs again. Equal or lower-priority incoming matches are skipped.
+8. **Incident key**: SHA-256 over normalized `(victim + attack type)` with a time window (`INCIDENT_DEDUPE_WINDOW_HOURS`) to skip same-victim incident follow-ups.
+9. **Digest-topic similarity**: compares title + abstract + article-text prefix for non-immediate items using `DIGEST_TOPIC_DEDUPE_THRESHOLD` and requires shared salient headline terms before skipping.
 
-Near-duplicate scores below `0.35` must also share salient headline terms or named entities before the article is skipped. If canonical URL, content hash, near-duplicate similarity, fingerprint, incident key, or digest-topic similarity already matches, the article is skipped.
+Near-duplicate scores below `0.40` must also share salient headline terms or named entities before the article is skipped or used for stored replacement. Exact canonical URL, content hash, and fingerprint duplicates are still always skipped; stored replacement only applies to near-similarity matches.
 
 ## Alert Qualification Flow (Two Channels)
 
@@ -171,7 +172,7 @@ Near-duplicate scores below `0.35` must also share salient headline terms or nam
 - Bare `impersonation` is not enough for cyber scope; it must be tied to phishing, credentials, accounts, tech support scams, brand/employee/executive impersonation, deepfakes, voice cloning, BEC, or social engineering.
 - Explicit out-of-scope rules suppress local/offline fraud blotter, community awareness/meeting items, vendor partnership announcements, administrative identity checks, generic explainers, and bare site-index results.
 - Confidence thresholds enforce both incident context and victim quality.
-- Incident-key, TF-IDF, and digest-topic dedupe suppress syndicated wire rewrites, source-title variants, and repeated digest topics.
+- Incident-key, TF-IDF, and digest-topic dedupe suppress syndicated wire rewrites, source-title variants, and repeated digest topics; better-source stored near-duplicates can replace lower-priority stored rewrites.
 - Victim extraction rejects generic users, product fragments, sentence spillover, and reporting-time fragments.
 - Digest routing preserves visibility while keeping immediate alerts conservative.
 

@@ -9,9 +9,16 @@ from sqlalchemy import inspect, select
 from app.alerts.emailer import AlertEmail, DigestEmailItem
 from app.config import Settings
 from app.db import Database
+from app.dedup.deduplicator import (
+    build_content_hash,
+    build_fingerprint,
+    build_similarity_document,
+    build_topic_document,
+    canonicalize_url,
+)
 from app.fetch.article_fetcher import ArticleContent
-from app.models import Alert, Article
-from app.pipeline import MonitorPipeline
+from app.models import Alert, Article, ArticleFingerprint
+from app.pipeline import MonitorPipeline, PipelineMetrics, _FetchedCandidate, _RunDedupeContext
 from app.schema_init import initialize_schema
 from app.sources.base import SourceArticle
 
@@ -620,7 +627,7 @@ def test_pipeline_low_score_near_duplicate_survives_without_title_or_entity_over
         assert len(session.scalars(select(Article)).all()) == 2
 
 
-def test_pipeline_high_score_near_duplicate_skips_without_title_overlap() -> None:
+def test_pipeline_borderline_near_duplicate_survives_without_title_or_entity_overlap() -> None:
     database = Database(_settings("sqlite+pysqlite:///:memory:"))
     initialize_schema(database)
 
@@ -639,6 +646,65 @@ def test_pipeline_high_score_near_duplicate_skips_without_title_overlap() -> Non
                     "Staff were warned about phishing messages with fake login pages designed to steal credentials. "
                     "The campaign copied company branding and asked employees to reset passwords. Analysts found "
                     "lookalike domains and credential harvesting forms."
+                ),
+                abstract="",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        current_run_near_duplicate_threshold=0.30,
+        digest_recipient_email="digest@example.com",
+        digest_topic_dedupe_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    metrics = pipeline.run(
+        [
+            SourceArticle("s1", "rss", "Chrome flaw exploited in attacks", "https://example.com/chrome", now),
+            SourceArticle(
+                "s2",
+                "rss",
+                "Microsoft Exchange zero-day patched",
+                "https://example.com/exchange",
+                now + timedelta(minutes=5),
+            ),
+        ]
+    )
+
+    assert metrics.skipped == 0
+    assert metrics.digest_queued == 2
+
+    with database.session() as session:
+        assert len(session.scalars(select(Article)).all()) == 2
+
+
+def test_pipeline_high_score_near_duplicate_skips_without_title_overlap() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/chrome": ArticleContent(
+                full_text=(
+                    "Employees received phishing emails that used fake login pages to steal credentials. "
+                    "The messages copied company branding and asked staff to reset passwords. Security teams "
+                    "found the campaign used lookalike domains and credential harvesting forms. Attackers "
+                    "registered domains that imitated the company portal and sent lures through compromised mailboxes."
+                ),
+                abstract="",
+            ),
+            "https://example.com/exchange": ArticleContent(
+                full_text=(
+                    "Staff were warned about phishing messages with fake login pages designed to steal credentials. "
+                    "The campaign copied company branding and asked employees to reset passwords. Analysts found "
+                    "lookalike domains and credential harvesting forms. Attackers registered domains that imitated "
+                    "the company portal and sent lures through compromised mailboxes."
                 ),
                 abstract="",
             ),
@@ -1415,6 +1481,494 @@ def test_pipeline_stored_near_threshold_controls_stored_matches() -> None:
 
     with database.session() as session:
         assert len(session.scalars(select(Article)).all()) == 2
+
+
+def test_pipeline_stored_near_duplicate_replaces_lower_priority_source_and_reprocesses() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://www.mexc.com/news/meta-nso": ArticleContent(
+                full_text=(
+                    "Meta said WhatsApp blocked a new NSO Group spyware phishing attack. "
+                    "Meta filed a contempt order against NSO Group after operators allegedly "
+                    "violated a court order. The attacks targeted WhatsApp users with one-click "
+                    "spyware links and malicious infrastructure."
+                ),
+                abstract="Meta said WhatsApp blocked a new NSO Group spyware phishing attack.",
+            ),
+            "https://thehackernews.com/2026/06/meta-nso-whatsapp.html": ArticleContent(
+                full_text=(
+                    "Meta said WhatsApp blocked a new NSO Group spyware phishing attack. "
+                    "Meta filed a contempt order against NSO Group after operators allegedly "
+                    "violated a court order. The phishing attacks targeted WhatsApp users with "
+                    "one-click spyware links and malicious infrastructure."
+                ),
+                abstract="Meta said WhatsApp blocked a new NSO Group spyware phishing attack.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+    )
+
+    now = datetime.now(timezone.utc)
+    first_metrics = pipeline.run(
+        [
+            SourceArticle(
+                "Google News",
+                "rss",
+                "Meta Stock: WhatsApp Takes Action Against NSO Group Spyware - MEXC",
+                "https://www.mexc.com/news/meta-nso",
+                now,
+            )
+        ]
+    )
+    second_metrics = pipeline.run(
+        [
+            SourceArticle(
+                "Google News",
+                "rss",
+                "Meta Blocks NSO Group's New WhatsApp Phishing Attack, Files Contempt Order - The Hacker News",
+                "https://thehackernews.com/2026/06/meta-nso-whatsapp.html",
+                now + timedelta(minutes=5),
+            )
+        ]
+    )
+
+    assert first_metrics.alerts_sent == 1
+    assert second_metrics.skipped == 0
+    assert second_metrics.alerts_sent == 1
+    assert len(emailer.sent) == 2
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        alerts = session.scalars(select(Alert).order_by(Alert.id)).all()
+        fingerprints = session.scalars(select(ArticleFingerprint)).all()
+
+        assert len(articles) == 1
+        assert articles[0].url == "https://thehackernews.com/2026/06/meta-nso-whatsapp.html"
+        assert articles[0].source_name == "Google News"
+        assert len(alerts) == 2
+        assert all(alert.article_id == articles[0].id for alert in alerts)
+        assert len(fingerprints) == 1
+        assert fingerprints[0].article_id == articles[0].id
+
+
+def test_pipeline_stored_near_duplicate_keeps_higher_priority_stored_source() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://thehackernews.com/2026/06/meta-nso-whatsapp.html": ArticleContent(
+                full_text=(
+                    "Meta said WhatsApp blocked a new NSO Group spyware phishing attack. "
+                    "Meta filed a contempt order against NSO Group after operators allegedly "
+                    "violated a court order. The phishing attacks targeted WhatsApp users with "
+                    "one-click spyware links and malicious infrastructure."
+                ),
+                abstract="Meta said WhatsApp blocked a new NSO Group spyware phishing attack.",
+            ),
+            "https://www.mexc.com/news/meta-nso": ArticleContent(
+                full_text=(
+                    "Meta said WhatsApp blocked a new NSO Group spyware phishing attack. "
+                    "Meta filed a contempt order against NSO Group after operators allegedly "
+                    "violated a court order. The attacks targeted WhatsApp users with one-click "
+                    "spyware links and malicious infrastructure."
+                ),
+                abstract="Meta said WhatsApp blocked a new NSO Group spyware phishing attack.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+    )
+
+    now = datetime.now(timezone.utc)
+    pipeline.run(
+        [
+            SourceArticle(
+                "Google News",
+                "rss",
+                "Meta Blocks NSO Group's New WhatsApp Phishing Attack, Files Contempt Order - The Hacker News",
+                "https://thehackernews.com/2026/06/meta-nso-whatsapp.html",
+                now,
+            )
+        ]
+    )
+    second_metrics = pipeline.run(
+        [
+            SourceArticle(
+                "Google News",
+                "rss",
+                "Meta Stock: WhatsApp Takes Action Against NSO Group Spyware - MEXC",
+                "https://www.mexc.com/news/meta-nso",
+                now + timedelta(minutes=5),
+            )
+        ]
+    )
+
+    assert second_metrics.skipped == 1
+    assert second_metrics.alerts_sent == 0
+    assert len(emailer.sent) == 1
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        assert len(articles) == 1
+        assert articles[0].url == "https://thehackernews.com/2026/06/meta-nso-whatsapp.html"
+
+
+def test_pipeline_stored_near_duplicate_keeps_equal_priority_stored_source() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://example.com/meta-nso-one": ArticleContent(
+                full_text=(
+                    "Meta said WhatsApp blocked a new NSO Group spyware phishing attack. "
+                    "Meta filed a contempt order against NSO Group after operators allegedly "
+                    "violated a court order. The phishing attacks targeted WhatsApp users with "
+                    "one-click spyware links and malicious infrastructure."
+                ),
+                abstract="Meta said WhatsApp blocked a new NSO Group spyware phishing attack.",
+            ),
+            "https://example.net/meta-nso-two": ArticleContent(
+                full_text=(
+                    "Meta said WhatsApp blocked a new NSO Group spyware phishing attack. "
+                    "Meta filed a contempt order against NSO Group after operators allegedly "
+                    "violated a court order. The attacks targeted WhatsApp users with one-click "
+                    "spyware links and malicious infrastructure."
+                ),
+                abstract="Meta said WhatsApp blocked a new NSO Group spyware phishing attack.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+    )
+
+    now = datetime.now(timezone.utc)
+    pipeline.run(
+        [
+            SourceArticle(
+                "Neutral Source",
+                "rss",
+                "Meta Blocks NSO Group WhatsApp Phishing Attack",
+                "https://example.com/meta-nso-one",
+                now,
+            )
+        ]
+    )
+    second_metrics = pipeline.run(
+        [
+            SourceArticle(
+                "Another Neutral Source",
+                "rss",
+                "Meta Blocks NSO Group WhatsApp Spyware Attack",
+                "https://example.net/meta-nso-two",
+                now + timedelta(minutes=5),
+            )
+        ]
+    )
+
+    assert second_metrics.skipped == 1
+    assert second_metrics.alerts_sent == 0
+    assert len(emailer.sent) == 1
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        assert len(articles) == 1
+        assert articles[0].url == "https://example.com/meta-nso-one"
+
+
+def test_pipeline_stored_replacement_excludes_target_from_digest_topic_dedupe() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://www.mexc.com/news/meta-nso": ArticleContent(
+                full_text=(
+                    "Meta said WhatsApp blocked a new NSO Group spyware phishing attack. "
+                    "Meta filed a contempt order against NSO Group after operators allegedly "
+                    "violated a court order. The attacks targeted WhatsApp users with one-click "
+                    "spyware links and malicious infrastructure."
+                ),
+                abstract="Meta said WhatsApp blocked a new NSO Group spyware phishing attack.",
+            ),
+            "https://thehackernews.com/2026/06/meta-nso-whatsapp.html": ArticleContent(
+                full_text=(
+                    "Meta said WhatsApp blocked a new NSO Group spyware phishing attack. "
+                    "Meta filed a contempt order against NSO Group after operators allegedly "
+                    "violated a court order. The phishing attacks targeted WhatsApp users with "
+                    "one-click spyware links and malicious infrastructure."
+                ),
+                abstract="Meta said WhatsApp blocked a new NSO Group spyware phishing attack.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        digest_recipient_email="digest@example.com",
+    )
+
+    now = datetime.now(timezone.utc)
+    first_metrics = pipeline.run(
+        [
+            SourceArticle(
+                "Google News",
+                "rss",
+                "Meta Stock: WhatsApp Takes Action Against NSO Group Spyware - MEXC",
+                "https://www.mexc.com/news/meta-nso",
+                now,
+            )
+        ]
+    )
+    second_metrics = pipeline.run(
+        [
+            SourceArticle(
+                "Google News",
+                "rss",
+                "Meta Blocks NSO Group's New WhatsApp Phishing Attack, Files Contempt Order - The Hacker News",
+                "https://thehackernews.com/2026/06/meta-nso-whatsapp.html",
+                now + timedelta(minutes=5),
+            )
+        ]
+    )
+
+    assert first_metrics.digest_queued == 1
+    assert first_metrics.digest_sent == 1
+    assert second_metrics.skipped == 0
+    assert second_metrics.digest_queued == 1
+    assert second_metrics.digest_sent == 1
+    assert len(emailer.sent) == 2
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        alerts = session.scalars(select(Alert).order_by(Alert.id)).all()
+        assert len(articles) == 1
+        assert articles[0].url == "https://thehackernews.com/2026/06/meta-nso-whatsapp.html"
+        assert len(alerts) == 2
+
+
+def test_pipeline_current_run_survivor_is_selected_before_stored_near_replacement(caplog) -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    fetcher = UrlMapFetcher(
+        {
+            "https://www.mexc.com/news/meta-nso": ArticleContent(
+                full_text=(
+                    "Meta said WhatsApp blocked a new NSO Group spyware phishing attack. "
+                    "Meta filed a contempt order against NSO Group after operators allegedly "
+                    "violated a court order. The attacks targeted WhatsApp users with one-click "
+                    "spyware links and malicious infrastructure."
+                ),
+                abstract="Meta said WhatsApp blocked a new NSO Group spyware phishing attack.",
+            ),
+            "https://example.org/meta-nso-analysis": ArticleContent(
+                full_text=(
+                    "Meta reported that WhatsApp stopped a new NSO Group spyware phishing attack. "
+                    "The company filed a contempt order after operators allegedly violated a court "
+                    "order. The operation targeted WhatsApp users with one-click spyware links and "
+                    "malicious infrastructure."
+                ),
+                abstract="Meta said WhatsApp blocked a new NSO Group spyware phishing attack.",
+            ),
+            "https://thehackernews.com/2026/06/meta-nso-whatsapp.html": ArticleContent(
+                full_text=(
+                    "Meta said WhatsApp blocked a new NSO Group spyware phishing attack. "
+                    "Meta filed a contempt order against NSO Group after operators allegedly "
+                    "violated a court order. The phishing attacks targeted WhatsApp users with "
+                    "one-click spyware links and malicious infrastructure."
+                ),
+                abstract="Meta said WhatsApp blocked a new NSO Group spyware phishing attack.",
+            ),
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=FakeVictimExtractor(),
+        emailer=emailer,
+    )
+
+    caplog.set_level(logging.INFO, logger="app.pipeline")
+    now = datetime.now(timezone.utc)
+    pipeline.run(
+        [
+            SourceArticle(
+                "Google News",
+                "rss",
+                "Meta Stock: WhatsApp Takes Action Against NSO Group Spyware - MEXC",
+                "https://www.mexc.com/news/meta-nso",
+                now,
+            )
+        ]
+    )
+    second_metrics = pipeline.run(
+        [
+            SourceArticle(
+                "Neutral Source",
+                "rss",
+                "Meta Blocks NSO Group WhatsApp Spyware Attack",
+                "https://example.org/meta-nso-analysis",
+                now + timedelta(minutes=10),
+            ),
+            SourceArticle(
+                "Google News",
+                "rss",
+                "Meta Blocks NSO Group's New WhatsApp Phishing Attack, Files Contempt Order - The Hacker News",
+                "https://thehackernews.com/2026/06/meta-nso-whatsapp.html",
+                now + timedelta(minutes=5),
+            ),
+        ]
+    )
+
+    assert second_metrics.skipped == 1
+    assert second_metrics.alerts_sent == 1
+    replacement_logs = [
+        record.message
+        for record in caplog.records
+        if "Stored duplicate replacement selected" in record.message
+    ]
+    assert len(replacement_logs) == 1
+    assert "url=https://thehackernews.com/2026/06/meta-nso-whatsapp.html" in replacement_logs[0]
+    assert "url=https://example.org/meta-nso-analysis" not in replacement_logs[0]
+
+    with database.session() as session:
+        articles = session.scalars(select(Article)).all()
+        assert len(articles) == 1
+        assert articles[0].url == "https://thehackernews.com/2026/06/meta-nso-whatsapp.html"
+
+
+def test_pipeline_stored_replacement_conflict_skips_safely() -> None:
+    database = Database(_settings("sqlite+pysqlite:///:memory:"))
+    initialize_schema(database)
+
+    target_content = ArticleContent(
+        full_text="Stored rewrite article about a Meta WhatsApp NSO phishing campaign.",
+        abstract="Stored rewrite article.",
+    )
+    conflicting_content = ArticleContent(
+        full_text="Separate existing article body that the replacement would duplicate exactly.",
+        abstract="Separate existing article.",
+    )
+    fetcher = UrlMapFetcher(
+        {
+            "https://www.mexc.com/news/meta-nso": target_content,
+            "https://example.com/conflict": conflicting_content,
+        }
+    )
+    emailer = FakeEmailer()
+    pipeline = MonitorPipeline(
+        database=database,
+        fetcher=fetcher,
+        classifier=FakeClassifier(),
+        victim_extractor=LowConfidenceVictimExtractor(),
+        emailer=emailer,
+        near_duplicate_enabled=False,
+        digest_topic_dedupe_enabled=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    pipeline.run(
+        [
+            SourceArticle(
+                "Google News",
+                "rss",
+                "Meta Stock: WhatsApp Takes Action Against NSO Group Spyware - MEXC",
+                "https://www.mexc.com/news/meta-nso",
+                now,
+            ),
+            SourceArticle(
+                "Neutral Source",
+                "rss",
+                "Unrelated stored article",
+                "https://example.com/conflict",
+                now + timedelta(minutes=1),
+            ),
+        ]
+    )
+
+    with database.session() as session:
+        target_id = session.scalar(
+            select(Article.id).where(Article.url == "https://www.mexc.com/news/meta-nso")
+        )
+        assert target_id is not None
+
+    replacement_item = SourceArticle(
+        "Google News",
+        "rss",
+        "Meta Blocks NSO Group's New WhatsApp Phishing Attack, Files Contempt Order - The Hacker News",
+        "https://thehackernews.com/2026/06/meta-nso-whatsapp.html",
+        now + timedelta(minutes=5),
+    )
+    replacement_candidate = _FetchedCandidate(
+        item=replacement_item,
+        content=conflicting_content,
+        canonical_url=canonicalize_url(replacement_item.url),
+        fingerprint=build_fingerprint(replacement_item.title, conflicting_content.full_text),
+        content_hash=build_content_hash(conflicting_content.full_text),
+        similarity_document=build_similarity_document(
+            replacement_item.title,
+            conflicting_content.abstract,
+            conflicting_content.full_text,
+        ),
+        topic_document=build_topic_document(
+            replacement_item.title,
+            conflicting_content.abstract,
+            conflicting_content.full_text,
+        ),
+        original_index=0,
+        replacement_article_id=target_id,
+    )
+    context = _RunDedupeContext(
+        existing_canonical_urls=set(),
+        content_hash_article_ids={},
+        fingerprint_article_ids={},
+        recent_articles=[],
+        near_duplicate_max_comparisons=500,
+    )
+
+    metrics = pipeline._process_prepared(
+        replacement_candidate,
+        digest_queue=[],
+        metrics=PipelineMetrics(processed=1),
+        context=context,
+    )
+
+    assert metrics.skipped == 1
+
+    with database.session() as session:
+        articles = session.scalars(select(Article).order_by(Article.id)).all()
+        assert len(articles) == 2
+        assert articles[0].url == "https://www.mexc.com/news/meta-nso"
 
 
 def test_pipeline_batches_stored_exact_key_skips() -> None:

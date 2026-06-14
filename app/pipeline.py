@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -32,7 +32,7 @@ from app.time_utils import ensure_utc
 
 logger = logging.getLogger(__name__)
 
-LOW_SCORE_DUPLICATE_GUARD_THRESHOLD = 0.35
+LOW_SCORE_DUPLICATE_GUARD_THRESHOLD = 0.40
 AGGREGATOR_SOURCE_NAMES = {"gdelt", "google news"}
 PRIMARY_SOURCE_DOMAINS = {
     "bleepingcomputer.com",
@@ -154,6 +154,7 @@ class _FetchedCandidate:
     similarity_document: str
     topic_document: str
     original_index: int
+    replacement_article_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -166,6 +167,8 @@ class _PreparedInput:
 @dataclass(frozen=True)
 class _RecentArticle:
     article_id: int
+    source_name: str
+    source_type: str
     title: str
     url: str
     published_at: datetime | None
@@ -178,7 +181,7 @@ class _RecentArticle:
 class _RunDedupeContext:
     existing_canonical_urls: set[str]
     content_hash_article_ids: dict[str, int]
-    fingerprint_ids: dict[str, int]
+    fingerprint_article_ids: dict[str, int]
     recent_articles: list[_RecentArticle]
     near_duplicate_max_comparisons: int
 
@@ -189,6 +192,8 @@ class _RunDedupeContext:
     def add_recent_article(
         self,
         article_id: int,
+        source_name: str,
+        source_type: str,
         title: str,
         url: str,
         abstract: str,
@@ -201,6 +206,8 @@ class _RunDedupeContext:
             0,
             _RecentArticle(
                 article_id=article_id,
+                source_name=source_name,
+                source_type=source_type,
                 title=title,
                 url=url,
                 published_at=published_at,
@@ -303,15 +310,15 @@ class MonitorPipeline:
         if stored_exact_count:
             metrics = metrics.add(skipped=stored_exact_count)
 
+        candidates, duplicate_count = self._dedupe_current_run_candidates(candidates)
+        if duplicate_count:
+            metrics = metrics.add(skipped=duplicate_count)
+
         candidates, stored_near_count = self._filter_stored_near_duplicates(candidates, context)
         if stored_near_count:
             metrics = metrics.add(skipped=stored_near_count)
 
-        survivors, duplicate_count = self._dedupe_current_run_candidates(candidates)
-        if duplicate_count:
-            metrics = metrics.add(skipped=duplicate_count)
-
-        for candidate in survivors:
+        for candidate in candidates:
             try:
                 metrics = self._process_prepared(candidate, digest_queue, metrics, context)
             except Exception as exc:
@@ -325,7 +332,7 @@ class MonitorPipeline:
         return _RunDedupeContext(
             existing_canonical_urls=self._load_existing_canonical_urls(canonical_urls),
             content_hash_article_ids={},
-            fingerprint_ids={},
+            fingerprint_article_ids={},
             recent_articles=self._load_recent_articles(),
             near_duplicate_max_comparisons=self.near_duplicate_max_comparisons,
         )
@@ -385,11 +392,13 @@ class MonitorPipeline:
                 duplicate_count += 1
                 continue
 
-            if candidate.fingerprint in context.fingerprint_ids:
+            fingerprint_article_id = context.fingerprint_article_ids.get(candidate.fingerprint)
+            if fingerprint_article_id:
                 logger.info(
-                    "Duplicate detected, skipping reason=fingerprint url=%s title=%s",
+                    "Duplicate detected, skipping reason=fingerprint url=%s title=%s existing_article_id=%s",
                     candidate.item.url,
                     candidate.item.title,
+                    fingerprint_article_id,
                 )
                 duplicate_count += 1
                 continue
@@ -415,12 +424,12 @@ class MonitorPipeline:
                     context.content_hash_article_ids.setdefault(content_hash, article_id)
 
             if fingerprints:
-                for fingerprint, fingerprint_id in session.execute(
-                    select(ArticleFingerprint.fingerprint, ArticleFingerprint.id).where(
+                for fingerprint, article_id in session.execute(
+                    select(ArticleFingerprint.fingerprint, ArticleFingerprint.article_id).where(
                         ArticleFingerprint.fingerprint.in_(fingerprints)
                     )
                 ):
-                    context.fingerprint_ids.setdefault(fingerprint, fingerprint_id)
+                    context.fingerprint_article_ids.setdefault(fingerprint, article_id)
 
     def _filter_stored_near_duplicates(
         self,
@@ -466,10 +475,33 @@ class MonitorPipeline:
                 survivors.append(candidate)
                 continue
 
+            incoming_priority = self._candidate_source_priority(candidate)
+            matched_priority = self._recent_article_source_priority(matched_article)
+            if incoming_priority > matched_priority:
+                logger.info(
+                    (
+                        "Stored duplicate replacement selected reason=near_similarity "
+                        "url=%s title=%s replacement_article_id=%s score=%.3f "
+                        "replaced_url=%s replaced_title=%s incoming_source_priority=%s "
+                        "stored_source_priority=%s"
+                    ),
+                    candidate.item.url,
+                    candidate.item.title,
+                    matched_article.article_id,
+                    match.score,
+                    matched_article.url,
+                    matched_article.title,
+                    incoming_priority,
+                    matched_priority,
+                )
+                survivors.append(replace(candidate, replacement_article_id=matched_article.article_id))
+                continue
+
             logger.info(
                 (
                     "Duplicate detected, skipping reason=near_similarity url=%s title=%s "
-                    "matched_article_id=%s score=%.3f matched_url=%s matched_title=%s"
+                    "matched_article_id=%s score=%.3f matched_url=%s matched_title=%s "
+                    "incoming_source_priority=%s stored_source_priority=%s"
                 ),
                 candidate.item.url,
                 candidate.item.title,
@@ -477,6 +509,8 @@ class MonitorPipeline:
                 match.score,
                 matched_article.url,
                 matched_article.title,
+                incoming_priority,
+                matched_priority,
             )
             duplicate_count += 1
         return survivors, duplicate_count
@@ -585,14 +619,20 @@ class MonitorPipeline:
     def _candidate_survivor_key(self, candidate: _FetchedCandidate) -> tuple[int, datetime, int]:
         published_at = ensure_utc(candidate.item.published_at)
         return (
-            self._source_priority(candidate),
+            self._candidate_source_priority(candidate),
             published_at or datetime.min.replace(tzinfo=timezone.utc),
             -candidate.original_index,
         )
 
-    def _source_priority(self, candidate: _FetchedCandidate) -> int:
-        source_name = candidate.item.source_name.strip().lower()
-        host = _normalized_host(candidate.item.url)
+    def _candidate_source_priority(self, candidate: _FetchedCandidate) -> int:
+        return self._source_priority(candidate.item.source_name, candidate.item.url)
+
+    def _recent_article_source_priority(self, article: _RecentArticle) -> int:
+        return self._source_priority(article.source_name, article.url)
+
+    def _source_priority(self, source_name: str, url: str) -> int:
+        source_name = source_name.strip().lower()
+        host = _normalized_host(url)
         if _host_matches(host, PRIMARY_SOURCE_DOMAINS):
             return 3
         if _host_matches(host, REWRITE_SOURCE_DOMAINS):
@@ -628,6 +668,7 @@ class MonitorPipeline:
         canonical_url = candidate.canonical_url
         fingerprint = candidate.fingerprint
         content_hash = candidate.content_hash
+        replacement_article_id = candidate.replacement_article_id
 
         classification = self.classifier.classify(item.title, content.full_text)
         victim = self.victim_extractor.extract(item.title, content.full_text)
@@ -643,7 +684,11 @@ class MonitorPipeline:
 
         duplicate_incident = False
         if classification.article_type == "incident" and classification.attack_type and incident_key:
-            duplicate_incident = self._has_recent_incident_duplicate(incident_key, item.published_at)
+            duplicate_incident = self._has_recent_incident_duplicate(
+                incident_key,
+                item.published_at,
+                exclude_article_id=replacement_article_id,
+            )
         if duplicate_incident:
             logger.info(
                 "Duplicate incident detected, skipping url=%s incident_key=%s",
@@ -664,6 +709,7 @@ class MonitorPipeline:
                 candidate,
                 item.published_at,
                 context,
+                exclude_article_id=replacement_article_id,
             )
             if topic_duplicate is not None:
                 logger.info(
@@ -688,37 +734,85 @@ class MonitorPipeline:
         suppressed_out_of_scope = False
 
         with self.database.session() as session:
-            existing = session.scalar(select(Article.id).where(Article.canonical_url == canonical_url))
+            canonical_query = select(Article.id).where(Article.canonical_url == canonical_url)
+            if replacement_article_id is not None:
+                canonical_query = canonical_query.where(Article.id != replacement_article_id)
+            existing = session.scalar(canonical_query)
             if existing:
-                logger.info(
-                    "Duplicate detected during insert guard, skipping reason=canonical_url url=%s title=%s",
-                    item.url,
-                    item.title,
-                )
+                if replacement_article_id is not None:
+                    logger.info(
+                        (
+                            "Duplicate detected during replacement guard, skipping "
+                            "reason=replacement_conflict conflict_type=canonical_url "
+                            "url=%s title=%s replacement_article_id=%s existing_article_id=%s"
+                        ),
+                        item.url,
+                        item.title,
+                        replacement_article_id,
+                        existing,
+                    )
+                else:
+                    logger.info(
+                        "Duplicate detected during insert guard, skipping reason=canonical_url url=%s title=%s",
+                        item.url,
+                        item.title,
+                    )
                 return metrics.add(skipped=1)
 
-            content_hash_exists = session.scalar(select(Article.id).where(Article.content_hash == content_hash))
+            content_hash_query = select(Article.id).where(Article.content_hash == content_hash)
+            if replacement_article_id is not None:
+                content_hash_query = content_hash_query.where(Article.id != replacement_article_id)
+            content_hash_exists = session.scalar(content_hash_query)
             if content_hash_exists:
-                logger.info(
-                    (
-                        "Duplicate detected during insert guard, skipping reason=content_hash "
-                        "url=%s title=%s existing_article_id=%s"
-                    ),
-                    item.url,
-                    item.title,
-                    content_hash_exists,
-                )
+                if replacement_article_id is not None:
+                    logger.info(
+                        (
+                            "Duplicate detected during replacement guard, skipping "
+                            "reason=replacement_conflict conflict_type=content_hash "
+                            "url=%s title=%s replacement_article_id=%s existing_article_id=%s"
+                        ),
+                        item.url,
+                        item.title,
+                        replacement_article_id,
+                        content_hash_exists,
+                    )
+                else:
+                    logger.info(
+                        (
+                            "Duplicate detected during insert guard, skipping reason=content_hash "
+                            "url=%s title=%s existing_article_id=%s"
+                        ),
+                        item.url,
+                        item.title,
+                        content_hash_exists,
+                    )
                 return metrics.add(skipped=1)
 
-            fp_exists = session.scalar(
-                select(ArticleFingerprint.id).where(ArticleFingerprint.fingerprint == fingerprint)
+            fingerprint_query = select(ArticleFingerprint.article_id).where(
+                ArticleFingerprint.fingerprint == fingerprint
             )
+            if replacement_article_id is not None:
+                fingerprint_query = fingerprint_query.where(ArticleFingerprint.article_id != replacement_article_id)
+            fp_exists = session.scalar(fingerprint_query)
             if fp_exists:
-                logger.info(
-                    "Duplicate detected during insert guard, skipping reason=fingerprint url=%s title=%s",
-                    item.url,
-                    item.title,
-                )
+                if replacement_article_id is not None:
+                    logger.info(
+                        (
+                            "Duplicate detected during replacement guard, skipping "
+                            "reason=replacement_conflict conflict_type=fingerprint "
+                            "url=%s title=%s replacement_article_id=%s existing_article_id=%s"
+                        ),
+                        item.url,
+                        item.title,
+                        replacement_article_id,
+                        fp_exists,
+                    )
+                else:
+                    logger.info(
+                        "Duplicate detected during insert guard, skipping reason=fingerprint url=%s title=%s",
+                        item.url,
+                        item.title,
+                    )
                 return metrics.add(skipped=1)
 
             try:
@@ -726,27 +820,49 @@ class MonitorPipeline:
                 victim_category = victim.victim_category or "unknown"
                 attack_type = classification.attack_type or "unknown"
 
-                article = Article(
-                    source_name=_clip(item.source_name, 1024),
-                    source_type=_clip(item.source_type, 40),
-                    title=item.title,
-                    url=item.url,
-                    canonical_url=canonical_url,
-                    published_at=item.published_at,
-                    article_text=content.full_text,
-                    abstract=content.abstract,
-                    article_type=_clip(classification.article_type, 40),
-                    attack_type=_clip(attack_type, 80),
-                    victim_name=_clip(victim_name, 200),
-                    victim_category=_clip(victim_category, 40),
-                    incident_key=incident_key,
-                    content_hash=content_hash,
-                )
-                session.add(article)
+                if replacement_article_id is not None:
+                    article = session.get(Article, replacement_article_id)
+                    if article is None:
+                        logger.info(
+                            (
+                                "Duplicate detected during replacement guard, skipping "
+                                "reason=replacement_conflict conflict_type=missing_target "
+                                "url=%s title=%s replacement_article_id=%s"
+                            ),
+                            item.url,
+                            item.title,
+                            replacement_article_id,
+                        )
+                        return metrics.add(skipped=1)
+                else:
+                    article = Article()
+                    session.add(article)
+
+                article.source_name = _clip(item.source_name, 1024)
+                article.source_type = _clip(item.source_type, 40)
+                article.title = item.title
+                article.url = item.url
+                article.canonical_url = canonical_url
+                article.published_at = item.published_at
+                article.article_text = content.full_text
+                article.abstract = content.abstract
+                article.article_type = _clip(classification.article_type, 40)
+                article.attack_type = _clip(attack_type, 80)
+                article.victim_name = _clip(victim_name, 200)
+                article.victim_category = _clip(victim_category, 40)
+                article.incident_key = incident_key
+                article.content_hash = content_hash
+
                 session.flush()
                 article_id = article.id
 
-                session.add(ArticleFingerprint(article_id=article.id, fingerprint=fingerprint))
+                fingerprint_record = session.scalar(
+                    select(ArticleFingerprint).where(ArticleFingerprint.article_id == article.id)
+                )
+                if fingerprint_record is None:
+                    session.add(ArticleFingerprint(article_id=article.id, fingerprint=fingerprint))
+                else:
+                    fingerprint_record.fingerprint = fingerprint
 
                 if immediate_ready:
                     immediate_email = self._build_immediate_email(item, content, classification, victim)
@@ -807,11 +923,23 @@ class MonitorPipeline:
                 alert_id = alert.id
             except IntegrityError:
                 session.rollback()
-                logger.info(
-                    "Duplicate detected during insert, skipping reason=integrity_error url=%s title=%s",
-                    item.url,
-                    item.title,
-                )
+                if replacement_article_id is not None:
+                    logger.info(
+                        (
+                            "Duplicate detected during replacement, skipping "
+                            "reason=replacement_conflict conflict_type=integrity_error "
+                            "url=%s title=%s replacement_article_id=%s"
+                        ),
+                        item.url,
+                        item.title,
+                        replacement_article_id,
+                    )
+                else:
+                    logger.info(
+                        "Duplicate detected during insert, skipping reason=integrity_error url=%s title=%s",
+                        item.url,
+                        item.title,
+                    )
                 return metrics.add(skipped=1)
 
         next_metrics = metrics.add(
@@ -822,6 +950,8 @@ class MonitorPipeline:
         if article_id is not None:
             context.add_recent_article(
                 article_id=article_id,
+                source_name=item.source_name,
+                source_type=item.source_type,
                 title=item.title,
                 url=item.url,
                 abstract=content.abstract,
@@ -911,20 +1041,27 @@ class MonitorPipeline:
             return "low_victim_confidence"
         return "qualified_incident"
 
-    def _has_recent_incident_duplicate(self, incident_key: str, candidate_time: datetime | None) -> bool:
+    def _has_recent_incident_duplicate(
+        self,
+        incident_key: str,
+        candidate_time: datetime | None,
+        exclude_article_id: int | None = None,
+    ) -> bool:
         with self.database.session() as session:
             matches = session.execute(
-                select(Article.published_at, Article.created_at).where(Article.incident_key == incident_key)
+                select(Article.id, Article.published_at, Article.created_at).where(Article.incident_key == incident_key)
             ).all()
 
         if not matches:
             return False
         candidate_reference = ensure_utc(candidate_time)
         if candidate_reference is None:
-            return True
+            return any(article_id != exclude_article_id for article_id, _, _ in matches)
 
         window = timedelta(hours=self.incident_dedupe_window_hours)
-        for published_at, created_at in matches:
+        for article_id, published_at, created_at in matches:
+            if article_id == exclude_article_id:
+                continue
             reference = ensure_utc(published_at or created_at)
             if reference is None:
                 return True
@@ -940,6 +1077,8 @@ class MonitorPipeline:
             rows = session.execute(
                 select(
                     Article.id,
+                    Article.source_name,
+                    Article.source_type,
                     Article.title,
                     Article.url,
                     Article.abstract,
@@ -955,10 +1094,12 @@ class MonitorPipeline:
             return []
 
         articles: list[_RecentArticle] = []
-        for article_id, title, url, abstract, text, published_at, created_at in rows:
+        for article_id, source_name, source_type, title, url, abstract, text, published_at, created_at in rows:
             articles.append(
                 _RecentArticle(
                     article_id=article_id,
+                    source_name=source_name,
+                    source_type=source_type,
                     title=title,
                     url=url,
                     published_at=published_at,
@@ -1001,12 +1142,19 @@ class MonitorPipeline:
         candidate: _FetchedCandidate,
         candidate_time: datetime | None,
         context: _RunDedupeContext,
+        exclude_article_id: int | None = None,
     ) -> _TopicDuplicateResult | None:
         recent_articles = self._recent_articles_for_window(
             context.recent_articles,
             candidate_time,
             self.digest_topic_dedupe_lookback_hours,
         )
+        if exclude_article_id is not None:
+            recent_articles = [
+                article
+                for article in recent_articles
+                if article.article_id != exclude_article_id
+            ]
         if not recent_articles:
             return None
 
